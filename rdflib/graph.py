@@ -1740,6 +1740,7 @@ class Graph(Node):
         initNs: Optional[Mapping[str, Any]] = None,  # noqa: N803
         initBindings: Optional[Mapping[str, Identifier]] = None,  # noqa: N803
         use_store_provided: bool = True,
+        atomic: bool = False,
         **kwargs: Any,
     ) -> None:
         """Update this graph with the given update query.
@@ -1751,6 +1752,11 @@ class Graph(Node):
                 If none are given, the namespaces from the graph's namespace manager are used.
             initBindings: Initial variable bindings to use.
             use_store_provided: Whether to use the store's update method if available.
+            atomic: Whether to execute the update in atomic update mode, in
+                which all operations of the update request are either all
+                committed or all rolled back. This requires store support
+                (currently only the `Memory` store supports it) and rejects
+                `LOAD` operations, as they may access the network.
             kwargs: Additional arguments to pass to the update processor.
 
         !!! warning "Caution"
@@ -1774,7 +1780,10 @@ class Graph(Node):
         else:
             query_graph = self.identifier
 
-        if hasattr(self.store, "update") and use_store_provided:
+        # Atomic update mode is implemented by the SPARQL update processor
+        # on top of stores that support it, so store-provided update
+        # implementations are not used for it.
+        if hasattr(self.store, "update") and use_store_provided and not atomic:
             try:
                 return self.store.update(
                     update_object,
@@ -1788,6 +1797,9 @@ class Graph(Node):
 
         if not isinstance(processor, query.UpdateProcessor):
             processor = plugin.get(processor, query.UpdateProcessor)(self)
+
+        if atomic:
+            kwargs["atomic"] = True
 
         return processor.update(update_object, initBindings, initNs, **kwargs)
 

@@ -460,6 +460,34 @@ class Store:
     def rollback(self) -> None:
         """ """
 
+    # Optional atomic update methods
+
+    def snapshot(self) -> Any:
+        """Return an opaque snapshot of the complete state of this store.
+
+        Together with `restore` this is used to implement the atomic SPARQL
+        Update mode, in which all operations of a single update request are
+        either all committed or all rolled back.
+
+        Stores that do not support atomic update mode must raise
+        `NotImplementedError` here, which happens before the first write of
+        the update request is carried out.
+        """
+        raise NotImplementedError(
+            "%s does not support atomic update mode" % type(self).__name__
+        )
+
+    def restore(self, snapshot: Any) -> None:
+        """Restore the state of this store from a snapshot previously
+        obtained through `snapshot`.
+
+        Stores that do not support atomic update mode must raise
+        `NotImplementedError` here.
+        """
+        raise NotImplementedError(
+            "%s does not support atomic update mode" % type(self).__name__
+        )
+
     # Optional graph methods
 
     def add_graph(self, graph: Graph) -> None:

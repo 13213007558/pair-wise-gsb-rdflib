@@ -286,6 +286,7 @@ def evalUpdate(
     graph: Graph,
     update: Update,
     initBindings: Optional[Mapping[str, Identifier]] = None,
+    atomic: bool = False,
 ) -> None:
     """http://www.w3.org/TR/sparql11-update/#updateLanguage
 
@@ -302,6 +303,19 @@ def evalUpdate(
 
     This will return None on success and raise Exceptions on error
 
+    If `atomic` is `True`, the update is executed in atomic update mode:
+    either all operations of the request are committed, or, if any
+    operation fails, the graph is rolled back to the exact state it had
+    before this call - including the existence of (empty) named graphs.
+    While the request is being evaluated, later operations still see the
+    effects of earlier ones; the effects are only published if all
+    operations succeed. Atomic update mode requires store support
+    (currently only the [`Memory`][rdflib.plugins.stores.memory.Memory]
+    store supports it); a store without support raises
+    `NotImplementedError` before the first write. `LOAD` operations are
+    rejected in atomic update mode, as they may access the network. The
+    transaction only spans this single call within this process.
+
     !!! warning "Security Considerations"
 
         This method can access indirectly requested network endpoints, for
@@ -317,6 +331,10 @@ def evalUpdate(
 
     """
 
+    if atomic:
+        _evalUpdateAtomic(graph, update, initBindings)
+        return
+
     for u in update.algebra:
         initBindings = dict((Variable(k), v) for k, v in (initBindings or {}).items())
 
@@ -324,30 +342,73 @@ def evalUpdate(
         ctx.prologue = u.prologue
 
         try:
-            if u.name == "Load":
-                evalLoad(ctx, u)
-            elif u.name == "Clear":
-                evalClear(ctx, u)
-            elif u.name == "Drop":
-                evalDrop(ctx, u)
-            elif u.name == "Create":
-                evalCreate(ctx, u)
-            elif u.name == "Add":
-                evalAdd(ctx, u)
-            elif u.name == "Move":
-                evalMove(ctx, u)
-            elif u.name == "Copy":
-                evalCopy(ctx, u)
-            elif u.name == "InsertData":
-                evalInsertData(ctx, u)
-            elif u.name == "DeleteData":
-                evalDeleteData(ctx, u)
-            elif u.name == "DeleteWhere":
-                evalDeleteWhere(ctx, u)
-            elif u.name == "Modify":
-                evalModify(ctx, u)
-            else:
-                raise Exception("Unknown update operation: %s" % (u,))
+            _evalOperation(ctx, u)
         except:  # noqa: E722
             if not u.silent:
                 raise
+
+
+def _evalOperation(ctx: QueryContext, u: CompValue) -> None:
+    """Evaluate a single update operation."""
+    if u.name == "Load":
+        evalLoad(ctx, u)
+    elif u.name == "Clear":
+        evalClear(ctx, u)
+    elif u.name == "Drop":
+        evalDrop(ctx, u)
+    elif u.name == "Create":
+        evalCreate(ctx, u)
+    elif u.name == "Add":
+        evalAdd(ctx, u)
+    elif u.name == "Move":
+        evalMove(ctx, u)
+    elif u.name == "Copy":
+        evalCopy(ctx, u)
+    elif u.name == "InsertData":
+        evalInsertData(ctx, u)
+    elif u.name == "DeleteData":
+        evalDeleteData(ctx, u)
+    elif u.name == "DeleteWhere":
+        evalDeleteWhere(ctx, u)
+    elif u.name == "Modify":
+        evalModify(ctx, u)
+    else:
+        raise Exception("Unknown update operation: %s" % (u,))
+
+
+def _evalUpdateAtomic(
+    graph: Graph,
+    update: Update,
+    initBindings: Optional[Mapping[str, Identifier]] = None,
+) -> None:
+    """Evaluate an update request in atomic update mode.
+
+    See [`evalUpdate`][rdflib.plugins.sparql.update.evalUpdate] for details.
+    """
+    for u in update.algebra:
+        if u.name == "Load":
+            raise ValueError(
+                "LOAD is not supported in atomic update mode, as it may "
+                "access the network."
+            )
+
+    # Raises NotImplementedError before the first write if the store does
+    # not support atomic update mode.
+    snapshot = graph.store.snapshot()
+
+    for u in update.algebra:
+        initBindings = dict((Variable(k), v) for k, v in (initBindings or {}).items())
+
+        ctx = QueryContext(graph, initBindings=initBindings)
+        ctx.prologue = u.prologue
+
+        checkpoint = graph.store.snapshot()
+        try:
+            _evalOperation(ctx, u)
+        except:  # noqa: E722
+            if not u.silent:
+                graph.store.restore(snapshot)
+                raise
+            # A SILENT operation error is ignored, as allowed by the spec,
+            # but any partial effects of the failed operation are undone.
+            graph.store.restore(checkpoint)

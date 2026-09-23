@@ -582,6 +582,89 @@ class Memory(Store):
                 pass  # we didn't know this graph, no problem
 
     # internal utility methods below
+    def snapshot(self) -> dict[str, Any]:
+        """Return a snapshot of the complete state of this store.
+
+        Together with [`restore`][rdflib.plugins.stores.memory.Memory.restore]
+        this implements the store level support for the atomic SPARQL Update
+        mode. The snapshot captures all triples, the existence of all
+        (including empty) named graphs and the namespace bindings, so that
+        restoring it brings the store back to the exact state it was in when
+        the snapshot was taken. Terms (including blank nodes) are shared
+        with the live store, so their identity is preserved across a
+        restore.
+        """
+        return self.__copy_state(
+            {
+                "spo": self.__spo,
+                "pos": self.__pos,
+                "osp": self.__osp,
+                "namespace": self.__namespace,
+                "prefix": self.__prefix,
+                "context_obj_map": self.__context_obj_map,
+                "triple_contexts": self.__tripleContexts,
+                "context_triples": self.__contextTriples,
+                "all_contexts": self.__all_contexts,
+                "default_contexts": self.__defaultContexts,
+            }
+        )
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Restore the state of this store from a snapshot previously
+        obtained through [`snapshot`][rdflib.plugins.stores.memory.Memory.snapshot].
+
+        The store is mutated in place, so objects holding this store (such as
+        a `Dataset` or `Graph` views of it) observe the restored state.
+        """
+        state = self.__copy_state(snapshot)
+        self.__spo = state["spo"]
+        self.__pos = state["pos"]
+        self.__osp = state["osp"]
+        self.__namespace = state["namespace"]
+        self.__prefix = state["prefix"]
+        self.__context_obj_map = state["context_obj_map"]
+        self.__tripleContexts = state["triple_contexts"]
+        self.__contextTriples = state["context_triples"]
+        self.__all_contexts = state["all_contexts"]
+        self.__defaultContexts = state["default_contexts"]
+
+    @staticmethod
+    def __copy_state(state: dict[str, Any]) -> dict[str, Any]:
+        """Deep-copy the mutable containers of a store state dict.
+
+        Terms and context (`Graph`) objects are intentionally shared, only
+        the containers are copied.
+        """
+        return {
+            "spo": {
+                s: {p: dict(objs) for p, objs in po.items()}
+                for s, po in state["spo"].items()
+            },
+            "pos": {
+                p: {o: dict(subjs) for o, subjs in os.items()}
+                for p, os in state["pos"].items()
+            },
+            "osp": {
+                o: {s: dict(preds) for s, preds in sp.items()}
+                for o, sp in state["osp"].items()
+            },
+            "namespace": dict(state["namespace"]),
+            "prefix": dict(state["prefix"]),
+            "context_obj_map": dict(state["context_obj_map"]),
+            "triple_contexts": {
+                triple: dict(ctxs) for triple, ctxs in state["triple_contexts"].items()
+            },
+            "context_triples": {
+                ctx: set(triples) for ctx, triples in state["context_triples"].items()
+            },
+            "all_contexts": set(state["all_contexts"]),
+            "default_contexts": (
+                dict(state["default_contexts"])
+                if state["default_contexts"] is not None
+                else None
+            ),
+        }
+
     def __add_triple_context(
         self,
         triple: _TripleType,
