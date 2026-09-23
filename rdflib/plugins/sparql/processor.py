@@ -14,7 +14,7 @@ from rdflib.plugins.sparql.algebra import translateQuery, translateUpdate
 from rdflib.plugins.sparql.evaluate import evalQuery
 from rdflib.plugins.sparql.parser import parseQuery, parseUpdate
 from rdflib.plugins.sparql.sparql import Query, Update
-from rdflib.plugins.sparql.update import evalUpdate
+from rdflib.plugins.sparql.update import UpdateReport, evalUpdate, evalUpdateWithReport
 from rdflib.query import Processor, Result, UpdateProcessor
 from rdflib.term import Identifier
 
@@ -65,6 +65,23 @@ def processUpdate(
     )
 
 
+def processUpdateWithReport(
+    graph: Graph,
+    updateString: str,
+    initBindings: Optional[Mapping[str, Identifier]] = None,
+    initNs: Optional[Mapping[str, Any]] = None,
+    base: Optional[str] = None,
+) -> UpdateReport:
+    """
+    Process a SPARQL Update Request
+    returns an UpdateReport describing the changes on success or raises
+    Exceptions on error
+    """
+    return evalUpdateWithReport(
+        graph, translateUpdate(parseUpdate(updateString), base, initNs), initBindings
+    )
+
+
 class SPARQLResult(Result):
     def __init__(self, res: Mapping[str, Any]):
         Result.__init__(self, res["type_"])
@@ -104,6 +121,35 @@ class SPARQLUpdateProcessor(UpdateProcessor):
             strOrQuery = translateUpdate(parseUpdate(strOrQuery), initNs=initNs)
 
         return evalUpdate(self.graph, strOrQuery, initBindings)
+
+    def update_with_report(
+        self,
+        strOrQuery: Union[str, Update],
+        initBindings: Optional[Mapping[str, Identifier]] = None,
+        initNs: Optional[Mapping[str, Any]] = None,
+    ) -> UpdateReport:
+        """
+        Like update, but returns an UpdateReport describing the quads each
+        update operation actually inserted and deleted.
+
+        !!! warning "Caution"
+
+            This method can access indirectly requested network endpoints, for
+            example, query processing will attempt to access network endpoints
+            specified in SERVICE directives.
+
+            When processing untrusted or potentially malicious queries, measures
+            should be taken to restrict network and file access.
+
+            For information on available security measures, see the RDFLib
+            [Security Considerations](../security_considerations.md)
+            documentation.
+        """
+
+        if isinstance(strOrQuery, str):
+            strOrQuery = translateUpdate(parseUpdate(strOrQuery), initNs=initNs)
+
+        return evalUpdateWithReport(self.graph, strOrQuery, initBindings)
 
 
 class SPARQLProcessor(Processor):

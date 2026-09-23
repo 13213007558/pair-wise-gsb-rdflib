@@ -319,6 +319,7 @@ if TYPE_CHECKING:
 
     import rdflib.query
     from rdflib.plugins.sparql.sparql import Query, Update
+    from rdflib.plugins.sparql.update import UpdateReport
 
 _SubjectType = Node
 _PredicateType = Node
@@ -1790,6 +1791,81 @@ class Graph(Node):
             processor = plugin.get(processor, query.UpdateProcessor)(self)
 
         return processor.update(update_object, initBindings, initNs, **kwargs)
+
+    def update_with_report(
+        self,
+        update_object: Union[Update, str],
+        processor: Union[str, rdflib.query.UpdateProcessor] = "sparql",
+        initNs: Optional[Mapping[str, Any]] = None,  # noqa: N803
+        initBindings: Optional[Mapping[str, Identifier]] = None,  # noqa: N803
+        use_store_provided: bool = True,
+        **kwargs: Any,
+    ) -> UpdateReport:
+        """Update this graph with the given update query and report the changes.
+
+        Works like update, but returns an UpdateReport describing the quads
+        each update operation actually inserted and deleted, as well as the
+        net change of the whole request.
+
+        The report is recorded while the request executes; no WHERE clause is
+        evaluated twice and blank nodes in the report are the identities that
+        were actually written to the store.
+
+        LOAD operations are not supported, and neither are stores that provide
+        their own update implementation (their writes cannot be observed); in
+        both cases NotImplementedError is raised before anything is executed.
+
+        Args:
+            update_object: The update query string or object to execute.
+            processor: The update processor to use. Default is "sparql".
+            initNs: Initial namespaces to use for resolving prefixes in the query.
+                If none are given, the namespaces from the graph's namespace manager are used.
+            initBindings: Initial variable bindings to use.
+            use_store_provided: Whether to use the store's update method if available.
+            kwargs: Additional arguments to pass to the update processor.
+
+        !!! warning "Caution"
+            This method can access indirectly requested network endpoints, for
+            example, query processing will attempt to access network endpoints
+            specified in SERVICE directives.
+
+            When processing untrusted or potentially malicious queries, measures
+            should be taken to restrict network and file access.
+
+            For information on available security measures, see the RDFLib
+            Security Considerations documentation.
+        """
+        initBindings = initBindings or {}  # noqa: N806
+        initNs = initNs or dict(self.namespaces())  # noqa: N806
+
+        if use_store_provided and self._store_provides_own_update():
+            raise NotImplementedError(
+                "update_with_report is not supported for stores that provide "
+                "their own update implementation (such as %r), because the "
+                "writes they perform cannot be observed; no changes were made."
+                % (type(self.store).__name__,)
+            )
+
+        if not isinstance(processor, query.UpdateProcessor):
+            processor = plugin.get(processor, query.UpdateProcessor)(self)
+
+        return processor.update_with_report(
+            update_object, initBindings, initNs, **kwargs
+        )
+
+    def _store_provides_own_update(self) -> bool:
+        """
+        Whether the store effectively provides its own update implementation.
+
+        Some stores (e.g. Memory) override update only to delegate to
+        Store.update, which raises NotImplementedError; those effectively do
+        not provide their own update implementation.
+        """
+        if type(self.store).update is Store.update:
+            return False
+        from rdflib.plugins.stores.memory import Memory, SimpleMemory
+
+        return not isinstance(self.store, (Memory, SimpleMemory))
 
     def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
         """Return an n3 identifier for the Graph"""
