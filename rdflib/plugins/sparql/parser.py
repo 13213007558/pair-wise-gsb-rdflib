@@ -715,6 +715,14 @@ NotExistsFunc = Comp(
 
 _Distinct = Optional(Keyword("DISTINCT"))
 _AggregateParams = "(" + Param("distinct", _Distinct) + Param("vars", Expression) + ")"
+_PercentileParams = (
+    "("
+    + Param("distinct", _Distinct)
+    + Param("p", Expression)
+    + ","
+    + Param("vars", Expression)
+    + ")"
+)
 
 Aggregate = (
     Comp(
@@ -738,6 +746,14 @@ Aggregate = (
         + Param("vars", Expression)
         + Optional(";" + Keyword("SEPARATOR") + "=" + Param("separator", String))
         + ")",
+    )
+    | Comp(
+        "Aggregate_PercentileCont",
+        Keyword("PERCENTILE_CONT") + _PercentileParams,
+    )
+    | Comp(
+        "Aggregate_PercentileDisc",
+        Keyword("PERCENTILE_DISC") + _PercentileParams,
     )
 )
 

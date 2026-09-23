@@ -1,11 +1,40 @@
 """
 Aggregation functions
+
+This module also provides the non-standard extension aggregates
+'PERCENTILE_CONT(p, expr)' and 'PERCENTILE_DISC(p, expr)'.
+
+They are explicitly enabled extensions (not part of SPARQL 1.1) and are
+available by default; they can be turned off (and back on) with
+:func:'enable_percentile_aggregates'.
+
+Semantics:
+
+* 'p' must be a numeric literal/expression in the closed interval [0, 1]
+  and must be invariant within each group.  A non-numeric, out-of-range,
+  NaN or group-varying 'p' is an error and makes the aggregate result
+  unbound for that group.
+* Rows where the value expression is unbound or evaluates to a non-numeric
+  literal are skipped, following the usual SPARQL aggregate error rules.
+* Values that are NaN (float/double/decimal) are ignored.
+* 'DISTINCT' is applied to the value expression before the percentile
+  is computed.
+* 'PERCENTILE_CONT' interpolates between the sorted values
+  ('p = 0' yields the minimum, 'p = 1' the maximum).  Numeric
+  promotion follows the SPARQL numeric type promotion rules; exact
+  decimal arithmetic is used unless a float/double is involved, so
+  high-precision decimals are never rounded through floats.
+* 'PERCENTILE_DISC' returns the first sorted value whose cumulative
+  distribution reaches 'p'; the result is always one of the actual
+  input readings, returned with its original datatype.
+* A group with no usable values (empty group) leaves the result unbound.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal, localcontext
 from typing import (
     Any,
     Optional,
@@ -19,8 +48,24 @@ from rdflib.plugins.sparql.datatypes import type_promotion
 from rdflib.plugins.sparql.evalutils import _eval, _val
 from rdflib.plugins.sparql.operators import numeric
 from rdflib.plugins.sparql.parserutils import CompValue
-from rdflib.plugins.sparql.sparql import FrozenBindings, NotBoundError, SPARQLTypeError
+from rdflib.plugins.sparql.sparql import (
+    FrozenBindings,
+    NotBoundError,
+    SPARQLError,
+    SPARQLTypeError,
+)
 from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
+
+PERCENTILE_AGGREGATES_ENABLED = True
+
+
+def enable_percentile_aggregates(enabled: bool = True) -> None:
+    """
+    Explicitly enable (or disable, with 'enabled=False') the
+    non-standard 'PERCENTILE_CONT' and 'PERCENTILE_DISC' aggregates.
+    """
+    global PERCENTILE_AGGREGATES_ENABLED
+    PERCENTILE_AGGREGATES_ENABLED = enabled
 
 
 class Accumulator:
@@ -271,6 +316,172 @@ class GroupConcat(Accumulator):
         return Literal(self.separator.join(str(v) for v in self.value))
 
 
+class Percentile(Accumulator):
+    """
+    Abstract base class for PERCENTILE_CONT and PERCENTILE_DISC.
+
+    Collects the numeric values of a group together with the percentile
+    parameter 'p', which must be numeric, within [0, 1] and invariant
+    within the group.
+    """
+
+    def __init__(self, aggregation: CompValue):
+        if not PERCENTILE_AGGREGATES_ENABLED:
+            raise SPARQLError(
+                "Percentile aggregates are not enabled, "
+                "call enable_percentile_aggregates() first"
+            )
+        super(Percentile, self).__init__(aggregation)
+        self.p_expr = aggregation.p
+        self.p: Optional[Union[Decimal, float, int]] = None
+        self.p_datatype: Optional[URIRef] = None
+        self.error = False
+        self.values: list[tuple[Union[Decimal, float, int], Literal]] = []
+
+    def use_row(self, row: FrozenBindings) -> bool:
+        try:
+            return _eval(self.expr, row) not in self.seen
+        except NotBoundError:
+            return False
+
+    def update(self, row: FrozenBindings, aggregator: Aggregator) -> None:
+        try:
+            p_literal = _eval(self.p_expr, row)
+        except NotBoundError:
+            p_literal = None
+        if p_literal is not None:
+            try:
+                p_num = numeric(p_literal)
+            except SPARQLTypeError:
+                self.error = True
+            else:
+                # NaN != NaN, so this also rejects NaN percentiles
+                if p_num != p_num or not 0 <= p_num <= 1:
+                    self.error = True
+                elif self.p is None:
+                    self.p = p_num
+                    self.p_datatype = p_literal.datatype
+                elif p_num != self.p:
+                    # p must be invariant within the group
+                    self.error = True
+        try:
+            value = _eval(self.expr, row)
+            num = numeric(value)
+        except NotBoundError:
+            # skip UNDEF
+            return
+        except SPARQLTypeError:
+            # skip non-numeric values, as the other aggregates do
+            return
+        if num != num:
+            # NaN values are ignored
+            return
+        self.values.append((num, value))
+        if self.distinct:
+            self.seen.add(value)
+
+    def sorted_values(self) -> Optional[list[tuple[Union[Decimal, float, int], Literal]]]:
+        if self.error or self.p is None or not self.values:
+            return None
+        # sort on the python numbers; int/Decimal/float compare exactly,
+        # so high-precision decimals are never rounded through floats
+        return sorted(self.values, key=lambda item: item[0])
+
+    def set_value(self, bindings: MutableMapping[Variable, Identifier]) -> None:
+        value = self.get_value()
+        if value is not None:
+            # an error, an empty group or no valid p leaves the var unbound
+            bindings[self.var] = value
+
+
+class PercentileCont(Percentile):
+    """
+    PERCENTILE_CONT(p, expr): interpolates between the sorted values.
+
+    p = 0 yields the minimum, p = 1 the maximum of the group.  The result
+    datatype follows the SPARQL numeric type promotion rules over the
+    group values and p; interpolation is done with exact decimal
+    arithmetic unless a float/double is involved.
+    """
+
+    def get_value(self) -> Optional[Literal]:
+        values = self.sorted_values()
+        if values is None:
+            return None
+        assert self.p is not None
+        nums = [num for num, _literal in values]
+        count = len(nums)
+        datatype: Optional[URIRef] = self.p_datatype
+        for _num, literal in values:
+            if datatype is None:
+                datatype = literal.datatype
+            else:
+                datatype = type_promotion(datatype, literal.datatype)
+        if datatype in (XSD.float, XSD.double):
+            fnums = [float(num) for num in nums]
+            rank = float(self.p) * (count - 1)
+            lower = math.floor(rank)
+            frac = rank - lower
+            if frac == 0 or lower >= count - 1:
+                result = fnums[min(lower, count - 1)]
+            else:
+                result = fnums[lower] + frac * (fnums[lower + 1] - fnums[lower])
+            return Literal(result, datatype=datatype)
+        # exact decimal arithmetic, never rounded through floats
+        prec = max(
+            [28]
+            + [
+                len(num.as_tuple().digits)
+                for num in nums + [self.p]
+                if isinstance(num, Decimal)
+            ]
+        )
+        with localcontext() as ctx:
+            ctx.prec = prec + 10
+            dnums = [
+                num if isinstance(num, Decimal) else Decimal(num) for num in nums
+            ]
+            p = self.p if isinstance(self.p, Decimal) else Decimal(self.p)
+            rank = p * (count - 1)
+            lower = int(rank.to_integral_value(rounding=ROUND_FLOOR))
+            frac = rank - lower
+            if frac == 0 or lower >= count - 1:
+                result_d = dnums[min(lower, count - 1)]
+            else:
+                result_d = dnums[lower] + frac * (dnums[lower + 1] - dnums[lower])
+            # strip insignificant trailing zeroes from the exact result
+            if result_d == result_d.to_integral_value():
+                result_d = result_d.quantize(Decimal(1))
+            else:
+                result_d = result_d.normalize()
+        if datatype == XSD.integer:
+            # only possible for integral p, i.e. the exact min/max
+            return Literal(int(result_d), datatype=XSD.integer)
+        return Literal(result_d, datatype=XSD.decimal)
+
+
+class PercentileDisc(Percentile):
+    """
+    PERCENTILE_DISC(p, expr): returns the first sorted value whose
+    cumulative distribution reaches p.
+
+    p = 0 yields the minimum, p = 1 the maximum of the group.  The result
+    is always one of the actual input readings, returned as the original
+    literal with its original datatype.
+    """
+
+    def get_value(self) -> Optional[Literal]:
+        values = self.sorted_values()
+        if values is None:
+            return None
+        assert self.p is not None
+        count = len(values)
+        # the cumulative distribution of element i (0-based) is (i+1)/count;
+        # take the first element with (i+1)/count >= p
+        index = max(math.ceil(self.p * count), 1) - 1
+        return values[index][1]
+
+
 class Aggregator:
     """combines different Accumulator objects"""
 
@@ -282,6 +493,8 @@ class Aggregator:
         "Aggregate_Min": Minimum,
         "Aggregate_Max": Maximum,
         "Aggregate_GroupConcat": GroupConcat,
+        "Aggregate_PercentileCont": PercentileCont,
+        "Aggregate_PercentileDisc": PercentileDisc,
     }
 
     def __init__(self, aggregations: list[CompValue]):
