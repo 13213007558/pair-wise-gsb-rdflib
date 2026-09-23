@@ -155,7 +155,9 @@ def evalJoin(ctx: QueryContext, join: CompValue) -> Generator[FrozenDict, None, 
         return evalLazyJoin(ctx, join)
     else:
         a = evalPart(ctx, join.p1)
-        b = set(evalPart(ctx, join.p2))
+        # materialize the right hand side as a list, NOT a set:
+        # solutions are a multiset and duplicate rows must be preserved
+        b = list(evalPart(ctx, join.p2))
         return _join(a, b)
 
 
@@ -253,9 +255,10 @@ def evalValues(
         c = ctx.push()
         try:
             for k, v in r.items():
-                if v != "UNDEF":
-                    c[k] = v
+                c[k] = v
         except AlreadyBound:
+            # a row incompatible with the already bound variables
+            # does not join, cf. the SPARQL join semantics
             continue
 
         yield c.solution()

@@ -31,7 +31,7 @@ from rdflib.paths import (
 from rdflib.plugins.sparql.operators import TrueFilter, and_
 from rdflib.plugins.sparql.operators import simplify as simplifyFilters
 from rdflib.plugins.sparql.parserutils import CompValue, Expr
-from rdflib.plugins.sparql.sparql import Prologue, Query, Update
+from rdflib.plugins.sparql.sparql import Prologue, Query, SPARQLError, Update
 
 # ---------------------------
 # Some convenience methods
@@ -42,7 +42,7 @@ def OrderBy(p: CompValue, expr: list[CompValue]) -> CompValue:
     return CompValue("OrderBy", p=p, expr=expr)
 
 
-def ToMultiSet(p: typing.Union[list[dict[Variable, str]], CompValue]) -> CompValue:
+def ToMultiSet(p: CompValue) -> CompValue:
     return CompValue("ToMultiSet", p=p)
 
 
@@ -82,7 +82,7 @@ def Extend(
     return CompValue("Extend", p=p, expr=expr, var=var)
 
 
-def Values(res: list[dict[Variable, str]]) -> CompValue:
+def Values(res: list[dict[Variable, Identifier]]) -> CompValue:
     return CompValue("values", res=res)
 
 
@@ -514,7 +514,11 @@ def _addVars(x, children: list[set[Variable]]) -> set[Variable]:
     if isinstance(x, Variable):
         return set([x])
     elif isinstance(x, CompValue):
-        if x.name == "RelationalExpression":
+        if x.name == "values":
+            # the variables a VALUES clause may bind are the keys of its rows;
+            # the traversal does not descend into the row dicts
+            x["_vars"] = set().union(*x.res) if x.res else set()
+        elif x.name == "RelationalExpression":
             x["_vars"] = set()
         elif x.name == "Extend":
             # vars only used in the expr for a bind should not be included
@@ -593,23 +597,66 @@ def translateAggregates(
     return CompValue("AggregateJoin", A=A, p=M), E
 
 
-def translateValues(
-    v: CompValue,
-) -> typing.Union[list[dict[Variable, str]], CompValue]:
-    # if len(v.var)!=len(v.value):
-    #     raise Exception("Unmatched vars and values in ValueClause: "+str(v))
+def _isUndef(value: Any) -> bool:
+    """
+    Is this parsed DataBlockValue the UNDEF keyword?
 
-    res: list[dict[Variable, str]] = []
-    if not v.var:
-        return res
-    if not v.value:
-        return res
-    if not isinstance(v.value[0], list):
-        for val in v.value:
-            res.append({v.var[0]: val})
-    else:
-        for vals in v.value:
-            res.append(dict(zip(v.var, vals)))
+    The parser yields the matched keyword as a plain string (in the case it
+    was written, since UNDEF is a case-insensitive keyword), whereas any
+    literal - including the plain literal "UNDEF" - is an Identifier.
+    """
+    return (
+        isinstance(value, str)
+        and not isinstance(value, Identifier)
+        and value.upper() == "UNDEF"
+    )
+
+
+def translateValues(v: CompValue) -> CompValue:
+    """
+    Translate a parsed VALUES clause / InlineData into a values CompValue.
+
+    The result is a multiset: rows - including duplicate rows - are preserved
+    in order. UNDEF cells are left out of the row dicts, i.e. the variable is
+    simply not bound in that row; UNDEF is not a term.
+
+    Malformed clauses (duplicate variables, rows with the wrong number of
+    values, illegal terms) are rejected here, i.e. before any evaluation.
+    """
+
+    variables: list[Variable] = list(v.var) if v.var else []
+    rows = v.value or []
+
+    if len(set(variables)) != len(variables):
+        raise SPARQLError(
+            "Duplicate variable in VALUES clause: "
+            + ", ".join(str(x) for x in variables)
+        )
+
+    res: list[dict[Variable, Identifier]] = []
+    for row in rows:
+        if variables and not isinstance(row, (list, ParseResults)):
+            # InlineDataOneVar: VALUES ?var { value1 value2 ... }
+            row = [row]
+        if len(row) != len(variables):
+            raise SPARQLError(
+                "Unmatched variables and values in VALUES clause: "
+                + "expected %d values for (%s), got %d"
+                % (
+                    len(variables),
+                    " ".join(str(x) for x in variables),
+                    len(row),
+                )
+            )
+        binding: dict[Variable, Identifier] = {}
+        for var, value in zip(variables, row):
+            if _isUndef(value):
+                # UNDEF: the variable stays unbound in this row
+                continue
+            if not isinstance(value, (URIRef, Literal)):
+                raise SPARQLError("Illegal term in VALUES clause: %r" % (value,))
+            binding[var] = value
+        res.append(binding)
 
     return Values(res)
 

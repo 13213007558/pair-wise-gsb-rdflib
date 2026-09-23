@@ -167,7 +167,11 @@ def test_cast_bool_to_bool():
 
 def test_call_exf():
     res = query("""SELECT (ex:f(42, "hello") as ?x) {}""")
-    eq_(len(list(res)), 0)
+    # the expression errors, so ?x stays unbound, but the (single, empty)
+    # solution of the empty group graph pattern is preserved
+    rows = list(res)
+    eq_(len(rows), 1)
+    eq_(rows[0][0], None)
 
 
 class TestCustom(TestCase):
@@ -198,8 +202,12 @@ class TestCustom(TestCase):
 
     def test_f_too_few_args(self):
         res = query("""SELECT (ex:f(42) as ?x) {}""")
-        eq_(len(list(res)), 0)
+        rows = list(res)
+        eq_(len(rows), 1)
+        eq_(rows[0][0], None)
 
     def test_f_too_many_args(self):
         res = query("""SELECT (ex:f(42, "hello", "world") as ?x) {}""")
-        eq_(len(list(res)), 0)
+        rows = list(res)
+        eq_(len(rows), 1)
+        eq_(rows[0][0], None)

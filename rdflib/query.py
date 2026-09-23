@@ -365,16 +365,17 @@ class Result:
 
             if self._genbindings:
                 for b in self._genbindings:
-                    if b:  # don't add a result row in case of empty binding {}
-                        self._bindings.append(b)
-                        # type error: Argument 2 to "ResultRow" has incompatible type "Optional[list[Variable]]"; expected "list[Variable]"
-                        yield ResultRow(b, self.vars)  # type: ignore[arg-type]
+                    # empty bindings {} are real solutions (e.g. an all-UNDEF
+                    # VALUES row or an empty group graph pattern) and must
+                    # be kept
+                    self._bindings.append(b)
+                    # type error: Argument 2 to "ResultRow" has incompatible type "Optional[list[Variable]]"; expected "list[Variable]"
+                    yield ResultRow(b, self.vars)  # type: ignore[arg-type]
                 self._genbindings = None
             else:
                 for b in self._bindings:
-                    if b:  # don't add a result row in case of empty binding {}
-                        # type error: Argument 2 to "ResultRow" has incompatible type "Optional[list[Variable]]"; expected "list[Variable]"
-                        yield ResultRow(b, self.vars)  # type: ignore[arg-type]
+                    # type error: Argument 2 to "ResultRow" has incompatible type "Optional[list[Variable]]"; expected "list[Variable]"
+                    yield ResultRow(b, self.vars)  # type: ignore[arg-type]
 
     def __getattr__(self, name: str) -> Any:
         if self.type in ("CONSTRUCT", "DESCRIBE") and self.graph is not None:

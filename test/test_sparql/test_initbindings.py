@@ -260,7 +260,8 @@ def test_distinct_order_by_limit():
 def test_prepare():
     q = prepareQuery("SELECT ?target WHERE { }")
     r = list(g.query(q))
-    e = []
+    # the empty group graph pattern matches with one (empty) solution
+    e = [(None,)]
     assert r == e, "prepare: %r != %r" % (r, e)
 
     r = list(g.query(q, initBindings={"target": Literal("example")}))
@@ -268,7 +269,7 @@ def test_prepare():
     assert r == e, "prepare: %r != %r" % (r, e)
 
     r = list(g.query(q))
-    e = []
+    e = [(None,)]
     assert r == e, "prepare: %r != %r" % (r, e)
 
 

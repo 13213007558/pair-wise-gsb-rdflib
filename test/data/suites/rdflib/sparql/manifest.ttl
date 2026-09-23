@@ -184,12 +184,18 @@ From https://github.com/RDFLib/rdflib/issues/615, contributed by https://github.
     mf:name "filters in optional";
     rdfs:comment """
     From https://github.com/RDFLib/rdflib/issues/619, contributed by https://github.com/pfps
+
+    The expected result was corrected: the FILTER is the LEFT JOIN condition
+    (SPARQL 1.1 section 18.2.2.8), so the outer "HI" row - whose only
+    compatible inner row fails the filter - is preserved, per the Diff
+    semantics of LEFT JOIN (SPARQL 1.1 section 18.3). This matches the
+    equivalent query written with triple patterns instead of VALUES.
 """;
     dawgt:approval dawgt:Approved ;
     dawgt:approvedBy <http://gromgull.net/me> ;
     mf:action
          [ qt:query <filteroptional.rq> ] ;
-    mf:result  <filtersubquery.tsv>
+    mf:result  <filteroptional.tsv>
     .
 
 
@@ -400,4 +406,3 @@ From https://github.com/RDFLib/rdflib/issues/615, contributed by https://github.
     mf:name    "Invalid multi-pass codepoint escaping (\\u then \\U)" ;
     mf:description "Unescaping one escape sequence must not produce content that is used in another escape sequence" ;
     mf:action  <syn-codepoint-escape-bad.rq> ;.
-
