@@ -75,6 +75,7 @@ class JsonLDSerializer(Serializer):
             )
 
         context_data = kwargs.get("context")
+        namespace_snapshot = kwargs.get("namespace_snapshot")
         use_native_types = (kwargs.get("use_native_types", False),)
         use_rdf_type = kwargs.get("use_rdf_type", False)
         auto_compact = kwargs.get("auto_compact", False)
@@ -91,6 +92,7 @@ class JsonLDSerializer(Serializer):
             use_native_types,
             use_rdf_type,
             auto_compact=auto_compact,
+            namespace_snapshot=namespace_snapshot,
         )
         if _HAS_ORJSON:
             option: int = orjson.OPT_NON_STR_KEYS
@@ -122,9 +124,15 @@ def from_rdf(
     auto_compact=False,
     startnode=None,
     index=False,
+    namespace_snapshot=None,
 ):
     # TODO: docstring w. args and return value
     # TODO: support for index and startnode
+
+    if context_data is None and namespace_snapshot is not None:
+        # Build the context solely from the serializer's own snapshot; the
+        # graph's live namespace manager is never consulted.
+        context_data = namespace_snapshot.to_jsonld_context()
 
     if not context_data and auto_compact:
         context_data = dict(

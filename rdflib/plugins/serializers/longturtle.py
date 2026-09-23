@@ -24,7 +24,7 @@ from typing import IO, Any, Optional
 from rdflib.compare import to_canonical_graph
 from rdflib.exceptions import Error
 from rdflib.graph import Graph, _TripleType
-from rdflib.namespace import RDF
+from rdflib.namespace import RDF, NamespaceSnapshot
 from rdflib.term import BNode, Literal, URIRef
 
 from .turtle import RecursiveSerializer
@@ -118,8 +118,11 @@ class LongTurtleSerializer(RecursiveSerializer):
         base: Optional[str] = None,
         encoding: Optional[str] = None,
         spacious: Optional[bool] = None,
+        namespace_snapshot: Optional[NamespaceSnapshot] = None,
         **kwargs: Any,
     ) -> None:
+        if namespace_snapshot is not None:
+            self._namespace_snapshot = namespace_snapshot
         self._canon = kwargs.get("canon", False)
         self.reset()
         self.stream = stream
@@ -179,7 +182,10 @@ class LongTurtleSerializer(RecursiveSerializer):
             return None
 
         try:
-            parts = self.store.compute_qname(uri, generate=gen_prefix)
+            if self._namespace_snapshot is not None:
+                parts = self._namespace_snapshot.compute_qname(uri, generate=gen_prefix)
+            else:
+                parts = self.store.compute_qname(uri, generate=gen_prefix)
         except Exception:
             # is the uri a namespace in itself?
             pfx = self.store.store.prefix(uri)

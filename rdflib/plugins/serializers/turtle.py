@@ -20,7 +20,7 @@ from typing import (
 
 from rdflib.exceptions import Error
 from rdflib.graph import Graph
-from rdflib.namespace import RDF, RDFS
+from rdflib.namespace import RDF, RDFS, NamespaceSnapshot
 from rdflib.serializer import Serializer
 from rdflib.term import BNode, Literal, Node, URIRef
 
@@ -45,6 +45,7 @@ class RecursiveSerializer(Serializer):
     )
 
     def __init__(self, store: Graph):
+        self._namespace_snapshot: Optional[NamespaceSnapshot] = None
         super(RecursiveSerializer, self).__init__(store)
         self.stream: Optional[IO[bytes]] = None
         self.reset()
@@ -116,7 +117,12 @@ class RecursiveSerializer(Serializer):
         self._subjects: dict[_SubjectType, bool] = {}
         self._topLevels: dict[_SubjectType, bool] = {}
 
-        if self.roundtrip_prefixes:
+        if self._namespace_snapshot is not None:
+            # Seed from the snapshot's stable, materialized bindings; the
+            # live store manager is never consulted.
+            for prefix, ns in self._namespace_snapshot.namespaces():
+                self.addNamespace(prefix, ns)
+        elif self.roundtrip_prefixes:
             if hasattr(self.roundtrip_prefixes, "__iter__"):
                 for prefix, ns in self.store.namespaces():
                     if prefix in self.roundtrip_prefixes:
@@ -254,8 +260,11 @@ class TurtleSerializer(RecursiveSerializer):
         base: Optional[str] = None,
         encoding: Optional[str] = None,
         spacious: Optional[bool] = None,
+        namespace_snapshot: Optional[NamespaceSnapshot] = None,
         **kwargs: Any,
     ) -> None:
+        if namespace_snapshot is not None:
+            self._namespace_snapshot = namespace_snapshot
         self.reset()
         self.stream = stream
         # if base is given here, use that, if not and a base is set for the graph use that
@@ -318,7 +327,10 @@ class TurtleSerializer(RecursiveSerializer):
         parts = None
 
         try:
-            parts = self.store.compute_qname(uri, generate=gen_prefix)
+            if self._namespace_snapshot is not None:
+                parts = self._namespace_snapshot.compute_qname(uri, generate=gen_prefix)
+            else:
+                parts = self.store.compute_qname(uri, generate=gen_prefix)
         except Exception:
             # is the uri a namespace in itself?
             pfx = self.store.store.prefix(uri)

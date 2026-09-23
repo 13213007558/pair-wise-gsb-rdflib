@@ -89,6 +89,7 @@ except ImportError:  # pragma: no cover
 
 
 from collections.abc import Iterable
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -109,6 +110,9 @@ __all__ = [
     "ClosedNamespace",
     "DefinedNamespace",
     "NamespaceManager",
+    "NamespaceConflict",
+    "NamespaceConflictError",
+    "NamespaceSnapshot",
     "BRICK",
     "CSVW",
     "DC",
@@ -527,6 +531,16 @@ class NamespaceManager:
         for p, n in self.namespaces():  # repopulate the trie
             insert_trie(self.__trie, str(n))
 
+    def snapshot(self) -> NamespaceSnapshot:
+        """Capture the current bindings of this manager in a
+        [NamespaceSnapshot][rdflib.namespace.NamespaceSnapshot].
+
+        The snapshot is standalone: later bindings on this manager are not
+        visible to the snapshot, and bindings added to the snapshot never
+        leak back into this manager.
+        """
+        return NamespaceSnapshot(self)
+
     @property
     def store(self) -> Store:
         return self.graph.store
@@ -603,7 +617,9 @@ class NamespaceManager:
             qNameParts = self.compute_qname(rdfTerm)  # noqa: N806
             return ":".join([qNameParts[0], qNameParts[-1]])
 
-    def compute_qname(self, uri: str, generate: bool = True) -> tuple[str, URIRef, str]:
+    def compute_qname(
+        self, uri: str, generate: bool = True
+    ) -> tuple[str, URIRef, str]:
         prefix: Optional[str]
         if uri not in self.__cache:
             if not _is_valid_uri(uri):
@@ -832,6 +848,356 @@ class NamespaceManager:
             if uri and uri[-1] == "#" and result[-1] != "#":
                 result = "%s#" % result
         return URIRef(result)
+
+
+class NamespaceConflict(Enum):
+    """Classification of a namespace binding conflict.
+
+    Returned by
+    [NamespaceSnapshot.bind][rdflib.namespace.NamespaceSnapshot.bind] to
+    report which kind of conflict a binding caused:
+
+    * NONE: no conflict, the binding was applied cleanly.
+    * PREFIX_REBOUND: the same prefix was already bound to a different URI.
+    * NAMESPACE_REBOUND: the same URI was already bound to a different
+      prefix.
+    * DEFAULT_CHANGED: the default (empty) prefix was already bound to a
+      different URI.
+    """
+
+    NONE = "none"
+    PREFIX_REBOUND = "prefix_rebound"
+    NAMESPACE_REBOUND = "namespace_rebound"
+    DEFAULT_CHANGED = "default_changed"
+
+
+class NamespaceConflictError(ValueError):
+    """Raised when a namespace binding conflicts with an existing binding and
+    the conflict policy of the snapshot is "error"."""
+
+    def __init__(
+        self,
+        conflict: NamespaceConflict,
+        prefix: str,
+        namespace: URIRef,
+        existing: Union[str, URIRef],
+    ):
+        self.conflict = conflict
+        self.prefix = prefix
+        self.namespace = namespace
+        self.existing = existing
+        super().__init__(
+            "cannot bind prefix %r to %s: %s (conflicts with %s)"
+            % (prefix, namespace, conflict.value, existing)
+        )
+
+
+# Conflict policies supported by NamespaceSnapshot:
+# * "replace": apply the new binding, resolving conflicts the same way the
+#   default NamespaceManager does.
+# * "keep": keep the existing binding and leave the snapshot unchanged.
+# * "error": raise NamespaceConflictError.
+_NAMESPACE_CONFLICT_POLICIES = ("replace", "keep", "error")
+
+
+class NamespaceSnapshot:
+    """An explicitly creatable and passable snapshot of namespace bindings.
+
+    A snapshot captures the prefix => namespace mappings of a
+    [NamespaceManager][rdflib.namespace.NamespaceManager] (or a fresh set of
+    well-known bindings), the default namespace (the binding of the empty
+    prefix) and a conflict policy, and then lives independently of its
+    source: bindings added to the source manager after the snapshot was
+    taken are not visible to the snapshot, and bindings added to the
+    snapshot never leak back into the source manager or into any other
+    snapshot.
+
+    Serializers that accept a `namespace_snapshot` argument (the Turtle
+    and JSON-LD serializers) only consult their own snapshot, so concurrent
+    requests can each serialize with different prefixes and formats without
+    cross-request leakage.
+
+    ```python
+    >>> from rdflib import Graph, URIRef
+    >>> from rdflib.namespace import NamespaceSnapshot
+    >>> g = Graph()
+    >>> g.bind("ex", "http://example.org/")
+    >>> snap = NamespaceSnapshot(g.namespace_manager)
+    >>> ("ex", URIRef("http://example.org/")) in snap.namespaces()
+    True
+    >>> snap.bind("ex2", "http://example.org/")
+    <NamespaceConflict.NAMESPACE_REBOUND: 'namespace_rebound'>
+    >>> dict(g.namespaces()).get("ex2") is None
+    True
+    >>> child = snap.copy()
+    >>> child.bind("ex3", "http://example.org/child/")
+    <NamespaceConflict.NONE: 'none'>
+    >>> ("ex3", URIRef("http://example.org/child/")) in snap.namespaces()
+    False
+
+    ```
+    """
+
+    def __init__(
+        self,
+        manager: Optional[NamespaceManager] = None,
+        *,
+        bind_namespaces: _NamespaceSetString = "rdflib",
+        conflict_policy: str = "replace",
+    ):
+        if conflict_policy not in _NAMESPACE_CONFLICT_POLICIES:
+            raise ValueError(
+                "unsupported conflict policy %r, expected one of %s"
+                % (conflict_policy, ", ".join(_NAMESPACE_CONFLICT_POLICIES))
+            )
+        self.conflict_policy = conflict_policy
+        self._prefix_to_ns: dict[str, URIRef] = {}
+        self._ns_to_prefix: dict[URIRef, str] = {}
+        self._qname_cache: dict[str, tuple[str, URIRef, str]] = {}
+        if manager is not None:
+            for prefix, namespace in manager.namespaces():
+                self._bind_raw(prefix, URIRef(namespace))
+        elif bind_namespaces == "none":
+            # binds no namespaces to prefixes
+            pass
+        elif bind_namespaces == "rdflib":
+            for prefix, ns in _NAMESPACE_PREFIXES_RDFLIB.items():
+                self._bind_raw(prefix, URIRef(str(ns)))
+            for prefix, ns in _NAMESPACE_PREFIXES_CORE.items():
+                self._bind_raw(prefix, URIRef(str(ns)))
+        elif bind_namespaces == "core":
+            for prefix, ns in _NAMESPACE_PREFIXES_CORE.items():
+                self._bind_raw(prefix, URIRef(str(ns)))
+        else:
+            raise ValueError(f"unsupported namespace set {bind_namespaces}")
+
+    def _bind_raw(self, prefix: str, namespace: URIRef) -> None:
+        old_namespace = self._prefix_to_ns.get(prefix)
+        if old_namespace is not None and old_namespace != namespace:
+            if self._ns_to_prefix.get(old_namespace) == prefix:
+                del self._ns_to_prefix[old_namespace]
+        old_prefix = self._ns_to_prefix.get(namespace)
+        if old_prefix is not None and old_prefix != prefix:
+            del self._prefix_to_ns[old_prefix]
+        self._prefix_to_ns[prefix] = namespace
+        self._ns_to_prefix[namespace] = prefix
+        self._qname_cache.clear()
+
+    @property
+    def default_namespace(self) -> Optional[URIRef]:
+        """The namespace bound to the default (empty) prefix, if any."""
+        return self._prefix_to_ns.get("")
+
+    def namespaces(self) -> tuple[tuple[str, URIRef], ...]:
+        """Return the captured (prefix, namespace) pairs as a stable tuple.
+
+        The result is materialized when called, in binding order, so
+        appending prefixes while iterating over the result does not modify
+        the ongoing iteration.
+        """
+        return tuple(self._prefix_to_ns.items())
+
+    def namespace(self, prefix: Optional[str]) -> Optional[URIRef]:
+        """Return the namespace bound to prefix, or None."""
+        return self._prefix_to_ns.get("" if prefix is None else str(prefix))
+
+    def prefix(self, namespace: Any) -> Optional[str]:
+        """Return the prefix bound to namespace, or None."""
+        return self._ns_to_prefix.get(URIRef(str(namespace)))
+
+    def bind(
+        self,
+        prefix: Optional[str],
+        namespace: Any,
+        override: bool = True,
+        replace: bool = False,
+    ) -> NamespaceConflict:
+        """Bind a given namespace to a prefix in this snapshot only.
+
+        The binding never leaks into the manager the snapshot was taken
+        from or into any other snapshot.
+
+        How a conflict is resolved depends on the conflict policy of the
+        snapshot:
+
+        * "replace": resolve the conflict the same way the default
+          [NamespaceManager][rdflib.namespace.NamespaceManager] does,
+          honouring the override and replace flags.
+        * "keep": leave the snapshot unchanged.
+        * "error": raise
+          [NamespaceConflictError][rdflib.namespace.NamespaceConflictError].
+
+        Returns the kind of conflict the binding caused, distinguishing
+        same-URI-new-prefix (NAMESPACE_REBOUND), same-prefix-new-URI
+        (PREFIX_REBOUND) and default prefix changes (DEFAULT_CHANGED), or
+        NamespaceConflict.NONE if the binding was clean.
+        """
+        namespace = URIRef(str(namespace))
+        if prefix is None:
+            prefix = ""
+        elif " " in prefix:
+            raise KeyError("Prefixes may not contain spaces.")
+        prefix = str(prefix)
+
+        bound_namespace = self._prefix_to_ns.get(prefix)
+        bound_prefix = self._ns_to_prefix.get(namespace)
+
+        conflict = NamespaceConflict.NONE
+        if bound_namespace is not None and bound_namespace != namespace:
+            conflict = (
+                NamespaceConflict.DEFAULT_CHANGED
+                if prefix == ""
+                else NamespaceConflict.PREFIX_REBOUND
+            )
+        elif bound_prefix is not None and bound_prefix != prefix:
+            conflict = NamespaceConflict.NAMESPACE_REBOUND
+
+        if conflict is not NamespaceConflict.NONE:
+            if self.conflict_policy == "error":
+                raise NamespaceConflictError(
+                    conflict,
+                    prefix,
+                    namespace,
+                    bound_namespace if bound_namespace is not None else bound_prefix,
+                )
+            if self.conflict_policy == "keep":
+                return conflict
+
+        if conflict in (
+            NamespaceConflict.PREFIX_REBOUND,
+            NamespaceConflict.DEFAULT_CHANGED,
+        ):
+            # policy "replace": mirror the default NamespaceManager behaviour
+            if replace:
+                self._bind_raw(prefix, namespace)
+            else:
+                # find an unused derived prefix, like the default manager does
+                stem = prefix or "default"
+                num = 1
+                while True:
+                    new_prefix = "%s%s" % (stem, num)
+                    existing = self._prefix_to_ns.get(new_prefix)
+                    if existing is None:
+                        break
+                    if existing == namespace:
+                        return conflict  # already bound to the right namespace
+                    num += 1
+                self._bind_raw(new_prefix, namespace)
+            return conflict
+
+        if conflict is NamespaceConflict.NAMESPACE_REBOUND:
+            # policy "replace"
+            assert bound_prefix is not None
+            if override or bound_prefix.startswith("_"):
+                self._bind_raw(prefix, namespace)
+            return conflict
+
+        if bound_namespace == namespace or bound_prefix == prefix:
+            pass  # already bound
+        else:
+            self._bind_raw(prefix, namespace)
+        return conflict
+
+    def compute_qname(self, uri: str, generate: bool = True) -> tuple[str, URIRef, str]:
+        """Compute a (prefix, namespace, local name) triple for uri using
+        only the bindings captured in this snapshot.
+
+        Like the default manager, unknown namespaces are bound to a
+        generated ns{index} prefix when generate is True; the generated
+        binding is added to this snapshot only.
+        """
+        uri = str(uri)
+        cached = self._qname_cache.get(uri)
+        if cached is not None:
+            return cached
+        if not _is_valid_uri(uri):
+            raise ValueError(
+                '"{}" does not look like a valid URI, cannot serialize this. Did you want to urlencode it?'.format(
+                    uri
+                )
+            )
+        try:
+            namespace, name = split_uri(uri)
+        except ValueError:
+            namespace, name = uri, ""
+
+        # Prefer the longest bound namespace that is longer than the split
+        # namespace and a prefix of the URI, mirroring NamespaceManager.
+        best: Optional[str] = None
+        for candidate in self._ns_to_prefix:
+            candidate_str = str(candidate)
+            if (
+                len(candidate_str) > len(namespace)
+                and uri.startswith(candidate_str)
+                and (best is None or len(candidate_str) > len(best))
+            ):
+                best = candidate_str
+        if best is not None:
+            namespace, name = best, uri[len(best) :]
+
+        namespace_uri = URIRef(namespace)
+        prefix = self._ns_to_prefix.get(namespace_uri)
+        if prefix is None:
+            if not generate:
+                raise KeyError(
+                    "No known prefix for {} and generate=False".format(namespace_uri)
+                )
+            num = 1
+            while True:
+                prefix = "ns%s" % num
+                if prefix not in self._prefix_to_ns:
+                    break
+                num += 1
+            self._bind_raw(prefix, namespace_uri)
+        result = (prefix, namespace_uri, name)
+        self._qname_cache[uri] = result
+        return result
+
+    def qname(self, uri: str) -> str:
+        prefix, _namespace, name = self.compute_qname(uri)
+        if prefix == "":
+            return name
+        else:
+            return ":".join((prefix, name))
+
+    def curie(self, uri: str, generate: bool = True) -> str:
+        prefix, _namespace, name = self.compute_qname(uri, generate=generate)
+        return ":".join((prefix, name))
+
+    def to_jsonld_context(self) -> dict[str, str]:
+        """Return the bindings as a JSON-LD context object.
+
+        Prefixes appear in binding order, so the resulting context has a
+        stable ordering; the default namespace, if any, is mapped to
+        @vocab.
+        """
+        context: dict[str, str] = {}
+        for prefix, namespace in self._prefix_to_ns.items():
+            context[prefix if prefix else "@vocab"] = str(namespace)
+        return context
+
+    def copy(self) -> NamespaceSnapshot:
+        """Return an independent copy of this snapshot.
+
+        Intended for handing bindings to child requests: the copy starts
+        with the same bindings, default namespace and conflict policy, but
+        incremental bindings on the copy never write back to this snapshot.
+        """
+        clone = NamespaceSnapshot.__new__(NamespaceSnapshot)
+        clone.conflict_policy = self.conflict_policy
+        clone._prefix_to_ns = dict(self._prefix_to_ns)
+        clone._ns_to_prefix = dict(self._ns_to_prefix)
+        clone._qname_cache = {}
+        return clone
+
+    def __contains__(self, ref: str) -> bool:
+        return any(ref.startswith(str(ns)) for ns in self._ns_to_prefix)
+
+    def __len__(self) -> int:
+        return len(self._prefix_to_ns)
+
+    def __repr__(self) -> str:
+        return "NamespaceSnapshot(%r)" % (self._prefix_to_ns,)
 
 
 # From: http://www.w3.org/TR/REC-xml#NT-CombiningChar
