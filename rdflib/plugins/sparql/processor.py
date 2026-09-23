@@ -55,13 +55,17 @@ def processUpdate(
     initBindings: Optional[Mapping[str, Identifier]] = None,
     initNs: Optional[Mapping[str, Any]] = None,
     base: Optional[str] = None,
+    atomic: bool = False,
 ) -> None:
     """
     Process a SPARQL Update Request
     returns Nothing on success or raises Exceptions on error
     """
     evalUpdate(
-        graph, translateUpdate(parseUpdate(updateString), base, initNs), initBindings
+        graph,
+        translateUpdate(parseUpdate(updateString), base, initNs),
+        initBindings,
+        atomic=atomic,
     )
 
 
@@ -84,6 +88,7 @@ class SPARQLUpdateProcessor(UpdateProcessor):
         strOrQuery: Union[str, Update],
         initBindings: Optional[Mapping[str, Identifier]] = None,
         initNs: Optional[Mapping[str, Any]] = None,
+        atomic: bool = False,
     ) -> None:
         """
         !!! warning "Caution"
@@ -103,7 +108,7 @@ class SPARQLUpdateProcessor(UpdateProcessor):
         if isinstance(strOrQuery, str):
             strOrQuery = translateUpdate(parseUpdate(strOrQuery), initNs=initNs)
 
-        return evalUpdate(self.graph, strOrQuery, initBindings)
+        return evalUpdate(self.graph, strOrQuery, initBindings, atomic=atomic)
 
 
 class SPARQLProcessor(Processor):

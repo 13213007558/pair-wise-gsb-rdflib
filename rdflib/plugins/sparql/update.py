@@ -12,6 +12,7 @@ from rdflib.plugins.sparql.evaluate import evalBGP, evalPart
 from rdflib.plugins.sparql.evalutils import _fillTemplate, _join
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import FrozenDict, QueryContext, Update
+from rdflib.store import Store
 from rdflib.term import Identifier, URIRef, Variable
 
 
@@ -61,9 +62,13 @@ def evalCreate(ctx: QueryContext, u: CompValue) -> None:
     http://www.w3.org/TR/sparql11-update/#create
     """
     g = ctx.dataset.get_context(u.graphiri)
-    if len(g) > 0:
+    store = ctx.dataset.store
+    if store.graph_aware:
+        if any(c.identifier == g.identifier for c in store.contexts()):
+            raise Exception("Graph %s already exists." % g.identifier)
+        store.add_graph(g)
+    elif len(g) > 0:
         raise Exception("Graph %s already exists." % g.identifier)
-    raise Exception("Create not implemented!")
 
 
 def evalClear(ctx: QueryContext, u: CompValue) -> None:
@@ -282,41 +287,55 @@ def evalCopy(ctx: QueryContext, u: CompValue) -> None:
     dstg += srcg  # type: ignore[operator]
 
 
-def evalUpdate(
+def _snapshot_store(store: Store) -> list:
+    """
+    Capture the full state of a store so it can be restored later.
+
+    For context-aware stores all contexts (including empty ones) and the
+    triples they contain are recorded, for other stores all triples are
+    recorded. The snapshot holds references to the very same term and
+    context objects, so restoring it preserves blank node identity.
+    """
+    if store.context_aware:
+        return [
+            (context, [t for t, _ in store.triples((None, None, None), context)])
+            for context in store.contexts()
+        ]
+    return [t for t, _ in store.triples((None, None, None))]
+
+
+def _restore_store(store: Store, snapshot: list) -> None:
+    """
+    Restore a store to the state captured by [_snapshot_store][].
+
+    The store is modified in place, so existing Graph objects viewing the
+    store see the restored contents.
+    """
+    if store.context_aware:
+        if store.graph_aware:
+            for context in list(store.contexts()):
+                store.remove_graph(context)
+            for context, triples in snapshot:
+                store.add_graph(context)
+                for triple in triples:
+                    store.add(triple, context)
+        else:
+            for context in list(store.contexts()):
+                store.remove((None, None, None), context)
+            for context, triples in snapshot:
+                for triple in triples:
+                    store.add(triple, context)
+    else:
+        store.remove((None, None, None))
+        for triple in snapshot:
+            store.add(triple, None)
+
+
+def _evalUpdateRequest(
     graph: Graph,
     update: Update,
     initBindings: Optional[Mapping[str, Identifier]] = None,
 ) -> None:
-    """http://www.w3.org/TR/sparql11-update/#updateLanguage
-
-    'A request is a sequence of operations [...] Implementations MUST
-    ensure that operations of a single request are executed in a
-    fashion that guarantees the same effects as executing them in
-    lexical order.
-
-    Operations all result either in success or failure.
-
-    If multiple operations are present in a single request, then a
-    result of failure from any operation MUST abort the sequence of
-    operations, causing the subsequent operations to be ignored.'
-
-    This will return None on success and raise Exceptions on error
-
-    !!! warning "Security Considerations"
-
-        This method can access indirectly requested network endpoints, for
-        example, query processing will attempt to access network endpoints
-        specified in `SERVICE` directives.
-
-        When processing untrusted or potentially malicious queries, measures
-        should be taken to restrict network and file access.
-
-        For information on available security measures, see the RDFLib
-        [Security Considerations](../security_considerations.md)
-        documentation.
-
-    """
-
     for u in update.algebra:
         initBindings = dict((Variable(k), v) for k, v in (initBindings or {}).items())
 
@@ -351,3 +370,72 @@ def evalUpdate(
         except:  # noqa: E722
             if not u.silent:
                 raise
+
+
+def evalUpdate(
+    graph: Graph,
+    update: Update,
+    initBindings: Optional[Mapping[str, Identifier]] = None,
+    atomic: bool = False,
+) -> None:
+    """http://www.w3.org/TR/sparql11-update/#updateLanguage
+
+    'A request is a sequence of operations [...] Implementations MUST
+    ensure that operations of a single request are executed in a
+    fashion that guarantees the same effects as executing them in
+    lexical order.
+
+    Operations all result either in success or failure.
+
+    If multiple operations are present in a single request, then a
+    result of failure from any operation MUST abort the sequence of
+    operations, causing the subsequent operations to be ignored.'
+
+    This will return None on success and raise Exceptions on error
+
+    If atomic is True, the whole request is executed atomically:
+    either all operations succeed and their effects are published, or
+    the effects of all operations are rolled back, restoring triples and
+    the existence of (possibly empty) named graphs to the state from
+    before the call. Atomic execution requires support from the
+    underlying store (see [atomic_update][rdflib.store.Store]) and does
+    not allow LOAD operations, as those may access external network
+    resources. The transaction scope is limited to this single call
+    within this process.
+
+    !!! warning "Security Considerations"
+
+        This method can access indirectly requested network endpoints, for
+        example, query processing will attempt to access network endpoints
+        specified in `SERVICE` directives.
+
+        When processing untrusted or potentially malicious queries, measures
+        should be taken to restrict network and file access.
+
+        For information on available security measures, see the RDFLib
+        [Security Considerations](../security_considerations.md)
+        documentation.
+
+    """
+    if not atomic:
+        _evalUpdateRequest(graph, update, initBindings)
+        return
+
+    store = graph.store
+    if not getattr(store, "atomic_update", False):
+        raise NotImplementedError(
+            "Atomic update is not supported by store %s" % type(store).__name__
+        )
+    for u in update.algebra:
+        if u.name == "Load":
+            raise ValueError(
+                "LOAD operations are not supported in atomic update mode, "
+                "as they may access external network resources."
+            )
+
+    snapshot = _snapshot_store(store)
+    try:
+        _evalUpdateRequest(graph, update, initBindings)
+    except BaseException:
+        _restore_store(store, snapshot)
+        raise

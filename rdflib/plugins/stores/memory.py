@@ -270,6 +270,7 @@ class Memory(Store):
     context_aware = True
     formula_aware = True
     graph_aware = True
+    atomic_update = True
 
     def __init__(
         self,

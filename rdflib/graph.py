@@ -1740,6 +1740,7 @@ class Graph(Node):
         initNs: Optional[Mapping[str, Any]] = None,  # noqa: N803
         initBindings: Optional[Mapping[str, Identifier]] = None,  # noqa: N803
         use_store_provided: bool = True,
+        atomic: bool = False,
         **kwargs: Any,
     ) -> None:
         """Update this graph with the given update query.
@@ -1751,6 +1752,14 @@ class Graph(Node):
                 If none are given, the namespaces from the graph's namespace manager are used.
             initBindings: Initial variable bindings to use.
             use_store_provided: Whether to use the store's update method if available.
+            atomic: If True, the update request is executed atomically, i.e.
+                either all operations in the request are applied or none of
+                them are. This requires support from the underlying store
+                (see [atomic_update][rdflib.store.Store]); stores without
+                support refuse the request before any data is written.
+                Atomic updates do not allow LOAD operations, as those may
+                access external network resources. The transaction scope is
+                limited to this single call within this process.
             kwargs: Additional arguments to pass to the update processor.
 
         !!! warning "Caution"
@@ -1774,7 +1783,7 @@ class Graph(Node):
         else:
             query_graph = self.identifier
 
-        if hasattr(self.store, "update") and use_store_provided:
+        if hasattr(self.store, "update") and use_store_provided and not atomic:
             try:
                 return self.store.update(
                     update_object,
@@ -1788,6 +1797,9 @@ class Graph(Node):
 
         if not isinstance(processor, query.UpdateProcessor):
             processor = plugin.get(processor, query.UpdateProcessor)(self)
+
+        if atomic:
+            kwargs["atomic"] = True
 
         return processor.update(update_object, initBindings, initNs, **kwargs)
 

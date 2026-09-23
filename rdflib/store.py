@@ -151,6 +151,11 @@ class Store:
     formula_aware: bool = False
     transaction_aware: bool = False
     graph_aware: bool = False
+    # Whether the store supports atomic execution of SPARQL update
+    # requests, i.e. all-or-nothing semantics for a single update call
+    # made with atomic=True. Stores that do not support this reject
+    # atomic update requests before any data is written.
+    atomic_update: bool = False
 
     def __init__(
         self,
