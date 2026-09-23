@@ -272,6 +272,306 @@ class Collection:
         self.graph.add((end, RDF.rest, RDF.nil))
         return self
 
+    def _validated_chain(self) -> tuple[list[Node], list[Node]]:
+        """
+        Return the chain nodes and their `rdf:first` values, from the
+        collection entry down to the last node before `rdf:nil`.
+
+        Raises `ValueError` if the list is malformed: a missing or
+        duplicated `rdf:first`/`rdf:rest` arc, or a cycle.
+        """
+        graph = self.graph
+        if self.uri == RDF.nil:
+            raise ValueError("Cannot splice the empty list (rdf:nil)")
+        if (self.uri, RDF.first, None) not in graph and (
+            self.uri,
+            RDF.rest,
+            None,
+        ) not in graph:
+            # An entry without any list arcs denotes the empty list.
+            return [], []
+        chain: list[Node] = []
+        items: list[Node] = []
+        seen: set[Node] = {RDF.nil}
+        node: Node = self.uri
+        while True:
+            if node in seen:
+                raise ValueError(
+                    "Malformed RDF Collection: %s (cycle at %s)" % (self.uri, node)
+                )
+            seen.add(node)
+            firsts = list(graph.objects(node, RDF.first))
+            if len(firsts) != 1:
+                raise ValueError(
+                    "Malformed RDF Collection: %s "
+                    "(node %s has %d rdf:first arcs)" % (self.uri, node, len(firsts))
+                )
+            rests = list(graph.objects(node, RDF.rest))
+            if len(rests) != 1:
+                raise ValueError(
+                    "Malformed RDF Collection: %s "
+                    "(node %s has %d rdf:rest arcs)" % (self.uri, node, len(rests))
+                )
+            chain.append(node)
+            items.append(firsts[0])
+            node = rests[0]
+            if node == RDF.nil:
+                return chain, items
+
+    def splice(
+        self,
+        start: int,
+        delete_count: int = 0,
+        values: Iterable[Node] = (),
+        *,
+        detach: bool = False,
+    ) -> list[Node]:
+        """
+        Remove `delete_count` items starting at index `start` and insert
+        `values` in their place, returning the removed items.  This is the
+        RDF-list analogue of JavaScript's `Array.prototype.splice`.
+
+        The whole chain is validated before anything is changed: a missing
+        or duplicated `rdf:first`/`rdf:rest` arc, a cycle, or an
+        out-of-range `start`/`delete_count` raises and leaves the graph
+        untouched.
+
+        List tails may be shared between collections.  A chain node is
+        *shared* when some other list can reach it, i.e. when a subject
+        other than its predecessor in this collection points with
+        `rdf:rest` at the node itself or at any node before it.  By
+        default, splicing refuses to rewrite or remove shared nodes and
+        raises `ValueError`.
+        With `detach=True` only the minimal required segment of the chain
+        is copied instead, so the other list keeps pointing at the original
+        chain:
+
+        * shared nodes that would be removed are simply left in place for
+          the other list; this collection stops referencing them;
+        * a shared node whose `rdf:rest` must be redirected is copied,
+          along with every shared node between it and this collection's
+          entry, and the copies are spliced into this chain;
+        * the collection entry itself is never copied or removed: it is
+          rewritten in place and keeps its identity, so external references
+          to it keep designating this (edited) list.  If the entry itself
+          is shared and would have to be rewritten, splicing fails even
+          with `detach=True`.
+
+        Items are resources of the graph, not part of the chain: they are
+        never copied or removed, only `rdf:first` arcs change.
+        Non-`rdf:first`/`rdf:rest` annotations on chain nodes are
+        preserved on the entry, duplicated onto copied nodes (the originals
+        keep theirs), and removed together with any chain node that is
+        deleted.
+
+        ```python
+        >>> from rdflib import Graph, Literal
+        >>> g = Graph()
+        >>> c = Collection(g, BNode(), [Literal(1), Literal(2), Literal(3)])
+        >>> removed = c.splice(1, 1, [Literal(20), Literal(21)])
+        >>> [v.toPython() for v in removed]
+        [2]
+        >>> [v.toPython() for v in c]
+        [1, 20, 21, 3]
+
+        ```
+
+        Splicing a list whose tail is shared with another list refuses to
+        rewrite the shared chain nodes by default, while `detach=True`
+        leaves the other list untouched:
+
+        ```python
+        >>> g = Graph()
+        >>> a = Collection(
+        ...     g, BNode(), [Literal(1), Literal(2), Literal(3), Literal(4)])
+        >>> shared = a._get_container(2)
+        >>> b = Collection(g, BNode(), [Literal(9)])
+        >>> g.set((b._end(), RDF.rest, shared)) # doctest: +ELLIPSIS
+        <Graph identifier=... (<class 'rdflib.graph.Graph'>)>
+        >>> [v.toPython() for v in b]
+        [9, 3, 4]
+        >>> a.splice(2, 1, [Literal(30)]) # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+        ...
+        ValueError: Cannot splice ... shared chain node(s) ...
+        >>> removed = a.splice(2, 1, [Literal(30)], detach=True)
+        >>> [v.toPython() for v in removed]
+        [3]
+        >>> [v.toPython() for v in a]
+        [1, 2, 30, 4]
+        >>> [v.toPython() for v in b]
+        [9, 3, 4]
+
+        ```
+        """
+        graph = self.graph
+        new_values = list(values)
+        chain, items = self._validated_chain()
+        length = len(chain)
+
+        if start < 0 or start > length:
+            raise IndexError(
+                "splice start %d out of range for collection of length %d"
+                % (start, length)
+            )
+        if delete_count < 0:
+            raise ValueError("delete_count must be >= 0")
+        if start + delete_count > length:
+            raise IndexError(
+                "splice of %d items at %d exceeds collection of length %d"
+                % (delete_count, start, length)
+            )
+
+        removed_items = items[start : start + delete_count]
+        if delete_count == 0 and not new_values:
+            return []
+
+        if length == 0:
+            # Splicing values into an empty list; the bare entry is reused.
+            if next(graph.subjects(RDF.rest, self.uri), None) is not None:
+                raise ValueError(
+                    "Cannot splice %s: the collection entry is shared and "
+                    "entry nodes are never copied" % (self.uri,)
+                )
+            graph.add((self.uri, RDF.first, new_values[0]))
+            previous = self.uri
+            for value in new_values[1:]:
+                node = BNode()
+                graph.add((node, RDF.first, value))
+                graph.add((previous, RDF.rest, node))
+                previous = node
+            graph.add((previous, RDF.rest, RDF.nil))
+            return []
+
+        # A node is shared if another list can reach it: some subject other
+        # than its predecessor in this chain rests into it or into any node
+        # before it, so sharing propagates down to the end of the chain.
+        shared: list[bool] = []
+        ancestor_shared = False
+        for index, chain_node in enumerate(chain):
+            predecessor = chain[index - 1] if index > 0 else None
+            if not ancestor_shared:
+                ancestor_shared = any(
+                    subject != predecessor
+                    for subject in graph.subjects(RDF.rest, chain_node)
+                )
+            shared.append(ancestor_shared)
+
+        def is_shared(index: int) -> bool:
+            return shared[index]
+
+        # Chain nodes the splice would rewrite in place or remove.
+        if start == 0:
+            rewritten = [0]
+            if not new_values and delete_count < length:
+                # The entry absorbs the first surviving node.
+                removed = list(range(1, delete_count + 1))
+            else:
+                removed = list(range(1, delete_count))
+        else:
+            rewritten = [start - 1]
+            removed = list(range(start, start + delete_count))
+
+        shared_removed = [index for index in removed if is_shared(index)]
+
+        if any(is_shared(index) for index in rewritten) or shared_removed:
+            if not detach:
+                raise ValueError(
+                    "Cannot splice %s: shared chain node(s) would be "
+                    "rewritten or removed; pass detach=True to detach this "
+                    "list from the shared chain segment" % (self.uri,)
+                )
+            if start == 0 and is_shared(0):
+                raise ValueError(
+                    "Cannot splice %s: the collection entry is shared and "
+                    "entry nodes are never copied" % (self.uri,)
+                )
+
+        link: Optional[Node] = None
+        if start > 0:
+            if detach and is_shared(start - 1):
+                # The node whose rdf:rest must be redirected is shared:
+                # copy it and every shared node up to the first private
+                # ancestor, which is then repointed at the copies.
+                private = start - 1
+                while private >= 0 and is_shared(private):
+                    private -= 1
+                if private < 0:
+                    raise ValueError(
+                        "Cannot splice %s: the shared chain segment reaches "
+                        "the collection entry and entry nodes are never "
+                        "copied" % (self.uri,)
+                    )
+                copies: list[Node] = []
+                for index in range(private + 1, start):
+                    source = chain[index]
+                    copy = BNode()
+                    for predicate, obj in graph.predicate_objects(source):
+                        if predicate not in (RDF.first, RDF.rest):
+                            graph.add((copy, predicate, obj))
+                    graph.add((copy, RDF.first, items[index]))
+                    copies.append(copy)
+                for left, right in zip(copies, copies[1:]):
+                    graph.add((left, RDF.rest, right))
+                graph.set((chain[private], RDF.rest, copies[0]))
+                link = copies[-1]
+            else:
+                link = chain[start - 1]
+
+        leave = set(shared_removed)
+        if start > 0:
+            assert link is not None
+            successor = (
+                chain[start + delete_count]
+                if start + delete_count < length
+                else RDF.nil
+            )
+            previous = link
+            for value in new_values:
+                node = BNode()
+                graph.add((node, RDF.first, value))
+                graph.set((previous, RDF.rest, node))
+                previous = node
+            graph.set((previous, RDF.rest, successor))
+        else:
+            entry = chain[0]
+            if not new_values and delete_count == length:
+                # Clearing the list; the entry survives as a bare node.
+                graph.remove((entry, RDF.first, None))
+                graph.remove((entry, RDF.rest, None))
+            elif not new_values:
+                # The entry absorbs the first surviving node.
+                survivor = chain[delete_count]
+                graph.set((entry, RDF.first, items[delete_count]))
+                graph.set((entry, RDF.rest, next(graph.objects(survivor, RDF.rest))))
+            else:
+                graph.set((entry, RDF.first, new_values[0]))
+                if delete_count == 0:
+                    # The old head value needs a new home.
+                    successor = BNode()
+                    graph.add((successor, RDF.first, items[0]))
+                    graph.add(
+                        (successor, RDF.rest, chain[1] if length > 1 else RDF.nil)
+                    )
+                else:
+                    successor = (
+                        chain[delete_count] if delete_count < length else RDF.nil
+                    )
+                previous = entry
+                for value in new_values[1:]:
+                    node = BNode()
+                    graph.add((node, RDF.first, value))
+                    graph.set((previous, RDF.rest, node))
+                    previous = node
+                graph.set((previous, RDF.rest, successor))
+
+        for index in removed:
+            if index in leave:
+                # Shared nodes stay in place for the other list.
+                continue
+            graph.remove((chain[index], None, None))
+        return removed_items
+
     def clear(self):
         container: Optional[Node] = self.uri
         graph = self.graph
