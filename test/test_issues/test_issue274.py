@@ -167,7 +167,9 @@ def test_cast_bool_to_bool():
 
 def test_call_exf():
     res = query("""SELECT (ex:f(42, "hello") as ?x) {}""")
-    eq_(len(list(res)), 0)
+    # evaluating the unknown function errors, so ?x stays unbound,
+    # but the solution itself is kept (SPARQL 1.1 Extend semantics)
+    eq_(list(res), [(None,)])
 
 
 class TestCustom(TestCase):
@@ -198,8 +200,8 @@ class TestCustom(TestCase):
 
     def test_f_too_few_args(self):
         res = query("""SELECT (ex:f(42) as ?x) {}""")
-        eq_(len(list(res)), 0)
+        eq_(list(res), [(None,)])
 
     def test_f_too_many_args(self):
         res = query("""SELECT (ex:f(42, "hello", "world") as ?x) {}""")
-        eq_(len(list(res)), 0)
+        eq_(list(res), [(None,)])

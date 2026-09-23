@@ -31,7 +31,7 @@ from rdflib.paths import (
 from rdflib.plugins.sparql.operators import TrueFilter, and_
 from rdflib.plugins.sparql.operators import simplify as simplifyFilters
 from rdflib.plugins.sparql.parserutils import CompValue, Expr
-from rdflib.plugins.sparql.sparql import Prologue, Query, Update
+from rdflib.plugins.sparql.sparql import Prologue, Query, SPARQLError, Update
 
 # ---------------------------
 # Some convenience methods
@@ -42,7 +42,7 @@ def OrderBy(p: CompValue, expr: list[CompValue]) -> CompValue:
     return CompValue("OrderBy", p=p, expr=expr)
 
 
-def ToMultiSet(p: typing.Union[list[dict[Variable, str]], CompValue]) -> CompValue:
+def ToMultiSet(p: CompValue) -> CompValue:
     return CompValue("ToMultiSet", p=p)
 
 
@@ -82,7 +82,7 @@ def Extend(
     return CompValue("Extend", p=p, expr=expr, var=var)
 
 
-def Values(res: list[dict[Variable, str]]) -> CompValue:
+def Values(res: list[dict[Variable, typing.Union[Identifier, str]]]) -> CompValue:
     return CompValue("values", res=res)
 
 
@@ -516,6 +516,10 @@ def _addVars(x, children: list[set[Variable]]) -> set[Variable]:
     elif isinstance(x, CompValue):
         if x.name == "RelationalExpression":
             x["_vars"] = set()
+        elif x.name == "values":
+            # the variables of a VALUES clause are set by translateValues;
+            # they are in scope even if all rows leave them unbound (UNDEF)
+            x["_vars"] = x["_vars"] if "_vars" in x else set()
         elif x.name == "Extend":
             # vars only used in the expr for a bind should not be included
             x["_vars"] = reduce(
@@ -593,25 +597,69 @@ def translateAggregates(
     return CompValue("AggregateJoin", A=A, p=M), E
 
 
-def translateValues(
-    v: CompValue,
-) -> typing.Union[list[dict[Variable, str]], CompValue]:
-    # if len(v.var)!=len(v.value):
-    #     raise Exception("Unmatched vars and values in ValueClause: "+str(v))
+def _isUndef(value: Any) -> bool:
+    """
+    Check whether a parsed DataBlockValue is the UNDEF keyword.
 
-    res: list[dict[Variable, str]] = []
-    if not v.var:
-        return res
-    if not v.value:
-        return res
-    if not isinstance(v.value[0], list):
-        for val in v.value:
-            res.append({v.var[0]: val})
-    else:
-        for vals in v.value:
-            res.append(dict(zip(v.var, vals)))
+    The parser produces the plain string "UNDEF" for the keyword; a strict
+    type check is needed so that the IRI <UNDEF> or the literal "UNDEF"
+    are not mistaken for it.
+    """
+    return type(value) is str and value == "UNDEF"
 
-    return Values(res)
+
+def _checkDataBlockValue(value: Any) -> None:
+    if _isUndef(value):
+        return
+    if not isinstance(value, (URIRef, Literal)):
+        raise SPARQLError("Illegal term in VALUES clause: %r" % (value,))
+
+
+def translateValues(v: CompValue) -> CompValue:
+    """
+    Translate a parsed VALUES clause / inline data block.
+
+    The result is a values CompValue with one solution mapping (dict)
+    per row.  UNDEF entries are kept as the plain string "UNDEF" and are
+    left unbound at evaluation time.  Rows are kept as-is: a VALUES block
+    is a multiset, so duplicate rows are preserved and any de-duplication
+    is up to outer operators (DISTINCT, REDUCED, ...).
+
+    Static errors (duplicated variables, rows with a wrong number of
+    values, illegal terms) are raised here, before any evaluation happens.
+    """
+
+    var: list[Variable] = v.var or []
+    if len(set(var)) != len(var):
+        raise SPARQLError("VALUES clause with duplicate variable: %s" % (v.var,))
+
+    res: list[dict[Variable, typing.Union[Identifier, str]]] = []
+    value = v.value
+    if value:
+        if not isinstance(value[0], list):
+            # InlineDataOneVar: a flat list of values for a single variable
+            for val in value:
+                _checkDataBlockValue(val)
+                res.append({var[0]: val})
+        else:
+            # InlineDataFull: one list of values per row
+            for vals in value:
+                if len(vals) != len(var):
+                    raise SPARQLError(
+                        "Unmatched variables and values in VALUES clause: "
+                        "%s vs. %s" % (v.var, vals)
+                    )
+                row: dict[Variable, typing.Union[Identifier, str]] = {}
+                for k, val in zip(var, vals):
+                    _checkDataBlockValue(val)
+                    row[k] = val
+                res.append(row)
+
+    res_cv = Values(res)
+    # the variables of a VALUES clause are in scope even if every row
+    # leaves them unbound (UNDEF); _addVars must not overwrite this
+    res_cv["_vars"] = set(var)
+    return res_cv
 
 
 def translate(q: CompValue) -> tuple[Optional[CompValue], list[Variable]]:

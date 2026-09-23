@@ -189,7 +189,7 @@ From https://github.com/RDFLib/rdflib/issues/615, contributed by https://github.
     dawgt:approvedBy <http://gromgull.net/me> ;
     mf:action
          [ qt:query <filteroptional.rq> ] ;
-    mf:result  <filtersubquery.tsv>
+    mf:result  <filteroptional.tsv>
     .
 
 

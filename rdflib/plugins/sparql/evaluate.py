@@ -155,17 +155,16 @@ def evalJoin(ctx: QueryContext, join: CompValue) -> Generator[FrozenDict, None, 
         return evalLazyJoin(ctx, join)
     else:
         a = evalPart(ctx, join.p1)
-        b = set(evalPart(ctx, join.p2))
+        # keep b a list: the right-hand side is a multiset and
+        # duplicate rows (e.g. from VALUES) must be preserved
+        b = list(evalPart(ctx, join.p2))
         return _join(a, b)
 
 
-def evalUnion(ctx: QueryContext, union: CompValue) -> list[Any]:
-    branch1_branch2 = []
-    for x in evalPart(ctx, union.p1):
-        branch1_branch2.append(x)
-    for x in evalPart(ctx, union.p2):
-        branch1_branch2.append(x)
-    return branch1_branch2
+def evalUnion(ctx: QueryContext, union: CompValue) -> Iterable[Any]:
+    # chain lazily so that a LIMIT further out does not force
+    # the second branch (or the rest of the first) to be evaluated
+    return itertools.chain(evalPart(ctx, union.p1), evalPart(ctx, union.p2))
 
 
 def evalMinus(ctx: QueryContext, minus: CompValue) -> Generator[FrozenDict, None, None]:
@@ -253,7 +252,9 @@ def evalValues(
         c = ctx.push()
         try:
             for k, v in r.items():
-                if v != "UNDEF":
+                # UNDEF is the plain string "UNDEF"; a strict type check
+                # keeps the IRI <UNDEF> and the literal "UNDEF" bound
+                if not (type(v) is str and v == "UNDEF"):
                     c[k] = v
         except AlreadyBound:
             continue
