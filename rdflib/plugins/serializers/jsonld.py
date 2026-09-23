@@ -40,7 +40,7 @@ import warnings
 from typing import IO, Any, Optional
 
 from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, Graph, _ObjectType
-from rdflib.namespace import RDF, XSD
+from rdflib.namespace import RDF, XSD, NamespaceSnapshot
 from rdflib.serializer import Serializer
 from rdflib.term import BNode, IdentifiedNode, Identifier, Literal, URIRef
 
@@ -57,8 +57,14 @@ PLAIN_LITERAL_TYPES = {XSD.boolean, XSD.integer, XSD.double, XSD.string}
 class JsonLDSerializer(Serializer):
     """JSON-LD RDF graph serializer."""
 
-    def __init__(self, store: Graph):
+    def __init__(
+        self, store: Graph, namespace_snapshot: Optional[NamespaceSnapshot] = None
+    ):
         super(JsonLDSerializer, self).__init__(store)
+        # An optional NamespaceSnapshot whose bindings are used to build
+        # the JSON-LD @context, isolated from the graph's shared
+        # namespace manager.
+        self.namespace_snapshot = namespace_snapshot
 
     def serialize(
         self,
@@ -78,6 +84,7 @@ class JsonLDSerializer(Serializer):
         use_native_types = (kwargs.get("use_native_types", False),)
         use_rdf_type = kwargs.get("use_rdf_type", False)
         auto_compact = kwargs.get("auto_compact", False)
+        namespace_snapshot = kwargs.get("namespace_snapshot", self.namespace_snapshot)
 
         indent = kwargs.get("indent", 2)
         separators = kwargs.get("separators", (",", ": "))
@@ -91,6 +98,7 @@ class JsonLDSerializer(Serializer):
             use_native_types,
             use_rdf_type,
             auto_compact=auto_compact,
+            namespace_snapshot=namespace_snapshot,
         )
         if _HAS_ORJSON:
             option: int = orjson.OPT_NON_STR_KEYS
@@ -122,9 +130,16 @@ def from_rdf(
     auto_compact=False,
     startnode=None,
     index=False,
+    namespace_snapshot=None,
 ):
     # TODO: docstring w. args and return value
     # TODO: support for index and startnode
+
+    if namespace_snapshot is not None and not context_data:
+        # use the snapshot's own, isolated bindings for the @context
+        snapshot_context = namespace_snapshot.to_jsonld_context()
+        if snapshot_context:
+            context_data = snapshot_context
 
     if not context_data and auto_compact:
         context_data = dict(

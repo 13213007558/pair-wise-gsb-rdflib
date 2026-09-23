@@ -20,7 +20,7 @@ from typing import (
 
 from rdflib.exceptions import Error
 from rdflib.graph import Graph
-from rdflib.namespace import RDF, RDFS
+from rdflib.namespace import RDF, RDFS, NamespaceSnapshot
 from rdflib.serializer import Serializer
 from rdflib.term import BNode, Literal, Node, URIRef
 
@@ -44,9 +44,17 @@ class RecursiveSerializer(Serializer):
         r"%(?![0-9A-Fa-f]{2})"
     )
 
-    def __init__(self, store: Graph):
+    def __init__(
+        self, store: Graph, namespace_snapshot: Optional[NamespaceSnapshot] = None
+    ):
         super(RecursiveSerializer, self).__init__(store)
         self.stream: Optional[IO[bytes]] = None
+        #: An optional
+        #: [`NamespaceSnapshot`][rdflib.namespace.NamespaceSnapshot] that
+        #: provides this serializer's own, isolated prefix bindings. When
+        #: set, the serializer never reads from or binds into the graph's
+        #: shared namespace manager.
+        self.namespace_snapshot = namespace_snapshot
         self.reset()
 
     def addNamespace(self, prefix: str, uri: URIRef) -> None:
@@ -116,7 +124,13 @@ class RecursiveSerializer(Serializer):
         self._subjects: dict[_SubjectType, bool] = {}
         self._topLevels: dict[_SubjectType, bool] = {}
 
-        if self.roundtrip_prefixes:
+        if self.namespace_snapshot is not None:
+            # Declare exactly the prefixes captured by the snapshot; the
+            # snapshot is a frozen view, so bindings added elsewhere while
+            # serializing cannot alter this set.
+            for prefix, ns in self.namespace_snapshot.namespaces():
+                self.addNamespace(prefix, ns)
+        elif self.roundtrip_prefixes:
             if hasattr(self.roundtrip_prefixes, "__iter__"):
                 for prefix, ns in self.store.namespaces():
                     if prefix in self.roundtrip_prefixes:
@@ -208,9 +222,11 @@ class TurtleSerializer(RecursiveSerializer):
         r"%(?![0-9A-Fa-f]{2})"
     )
 
-    def __init__(self, store: Graph):
+    def __init__(
+        self, store: Graph, namespace_snapshot: Optional[NamespaceSnapshot] = None
+    ):
         self._ns_rewrite: dict[str, str] = {}
-        super(TurtleSerializer, self).__init__(store)
+        super(TurtleSerializer, self).__init__(store, namespace_snapshot)
         self.keywords: dict[Node, str] = {RDF.type: "a"}
         self.reset()
         self.stream = None
@@ -256,6 +272,8 @@ class TurtleSerializer(RecursiveSerializer):
         spacious: Optional[bool] = None,
         **kwargs: Any,
     ) -> None:
+        if "namespace_snapshot" in kwargs:
+            self.namespace_snapshot = kwargs["namespace_snapshot"]
         self.reset()
         self.stream = stream
         # if base is given here, use that, if not and a base is set for the graph use that
@@ -318,10 +336,16 @@ class TurtleSerializer(RecursiveSerializer):
         parts = None
 
         try:
-            parts = self.store.compute_qname(uri, generate=gen_prefix)
+            if self.namespace_snapshot is not None:
+                parts = self.namespace_snapshot.compute_qname(uri, generate=gen_prefix)
+            else:
+                parts = self.store.compute_qname(uri, generate=gen_prefix)
         except Exception:
             # is the uri a namespace in itself?
-            pfx = self.store.store.prefix(uri)
+            if self.namespace_snapshot is not None:
+                pfx = self.namespace_snapshot.prefix(uri)
+            else:
+                pfx = self.store.store.prefix(uri)
 
             if pfx is not None:
                 parts = (pfx, uri, "")
