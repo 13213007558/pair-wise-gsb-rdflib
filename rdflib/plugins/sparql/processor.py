@@ -23,13 +23,20 @@ def prepareQuery(
     queryString: str,
     initNs: Optional[Mapping[str, Any]] = None,
     base: Optional[str] = None,
+    bounded_path_repeat: bool = False,
 ) -> Query:
     """
     Parse and translate a SPARQL Query
+
+    If `bounded_path_repeat` is true, the RDFLib extension for bounded
+    path repetition (`elt{n}` / `elt{n,m}`) is accepted in property
+    paths.
     """
     if initNs is None:
         initNs = {}
-    ret = translateQuery(parseQuery(queryString), base, initNs)
+    ret = translateQuery(
+        parseQuery(queryString, bounded_path_repeat=bounded_path_repeat), base, initNs
+    )
     ret._original_args = (queryString, initNs, base)
     return ret
 
@@ -38,13 +45,22 @@ def prepareUpdate(
     updateString: str,
     initNs: Optional[Mapping[str, Any]] = None,
     base: Optional[str] = None,
+    bounded_path_repeat: bool = False,
 ) -> Update:
     """
     Parse and translate a SPARQL Update
+
+    If `bounded_path_repeat` is true, the RDFLib extension for bounded
+    path repetition (`elt{n}` / `elt{n,m}`) is accepted in property
+    paths.
     """
     if initNs is None:
         initNs = {}
-    ret = translateUpdate(parseUpdate(updateString), base, initNs)
+    ret = translateUpdate(
+        parseUpdate(updateString, bounded_path_repeat=bounded_path_repeat),
+        base,
+        initNs,
+    )
     ret._original_args = (updateString, initNs, base)
     return ret
 
@@ -55,13 +71,20 @@ def processUpdate(
     initBindings: Optional[Mapping[str, Identifier]] = None,
     initNs: Optional[Mapping[str, Any]] = None,
     base: Optional[str] = None,
+    bounded_path_repeat: bool = False,
 ) -> None:
     """
     Process a SPARQL Update Request
     returns Nothing on success or raises Exceptions on error
     """
     evalUpdate(
-        graph, translateUpdate(parseUpdate(updateString), base, initNs), initBindings
+        graph,
+        translateUpdate(
+            parseUpdate(updateString, bounded_path_repeat=bounded_path_repeat),
+            base,
+            initNs,
+        ),
+        initBindings,
     )
 
 
@@ -84,6 +107,7 @@ class SPARQLUpdateProcessor(UpdateProcessor):
         strOrQuery: Union[str, Update],
         initBindings: Optional[Mapping[str, Identifier]] = None,
         initNs: Optional[Mapping[str, Any]] = None,
+        bounded_path_repeat: bool = False,
     ) -> None:
         """
         !!! warning "Caution"
@@ -101,7 +125,10 @@ class SPARQLUpdateProcessor(UpdateProcessor):
         """
 
         if isinstance(strOrQuery, str):
-            strOrQuery = translateUpdate(parseUpdate(strOrQuery), initNs=initNs)
+            strOrQuery = translateUpdate(
+                parseUpdate(strOrQuery, bounded_path_repeat=bounded_path_repeat),
+                initNs=initNs,
+            )
 
         return evalUpdate(self.graph, strOrQuery, initBindings)
 
@@ -121,11 +148,17 @@ class SPARQLProcessor(Processor):
         initNs: Optional[Mapping[str, Any]] = None,
         base: Optional[str] = None,
         DEBUG: bool = False,
+        bounded_path_repeat: bool = False,
     ) -> Mapping[str, Any]:
         """
         Evaluate a query with the given initial bindings, and initial
         namespaces. The given base is used to resolve relative URIs in
         the query and will be overridden by any BASE given in the query.
+
+        If `bounded_path_repeat` is true, the RDFLib extension for
+        bounded path repetition (`elt{n}` / `elt{n,m}`) is accepted
+        in property paths. By default the extension is disabled and such
+        paths are rejected as invalid SPARQL 1.1.
 
         !!! warning "Caution"
 
@@ -142,6 +175,10 @@ class SPARQLProcessor(Processor):
         """
 
         if isinstance(strOrQuery, str):
-            strOrQuery = translateQuery(parseQuery(strOrQuery), base, initNs)
+            strOrQuery = translateQuery(
+                parseQuery(strOrQuery, bounded_path_repeat=bounded_path_repeat),
+                base,
+                initNs,
+            )
 
         return evalQuery(self.graph, strOrQuery, initBindings, base)

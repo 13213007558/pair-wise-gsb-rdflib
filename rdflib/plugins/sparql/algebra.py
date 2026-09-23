@@ -22,6 +22,7 @@ from pyparsing import ParseResults
 
 from rdflib.paths import (
     AlternativePath,
+    BoundedPath,
     InvPath,
     MulPath,
     NegatedPath,
@@ -224,13 +225,18 @@ def translatePath(p: typing.Union[CompValue, URIRef]) -> Optional[Path]:  # type
             if not p.mod:
                 return p.part
             else:
-                if isinstance(p.part, list):
-                    if len(p.part) != 1:
+                part = p.part
+                if isinstance(part, list):
+                    if len(part) != 1:
                         raise Exception("Denkfehler!")
+                    part = part[0]
 
-                    return MulPath(p.part[0], p.mod)
+                if isinstance(p.mod, CompValue) and p.mod.name == "BoundedPathMod":
+                    # RDFLib extension: bounded repetition '{n}' / '{n,m}'
+                    max_ = p.mod.max if p.mod.max is not None else p.mod.min
+                    return BoundedPath(part, p.mod.min, max_)
                 else:
-                    return MulPath(p.part, p.mod)
+                    return MulPath(part, p.mod)
 
         elif p.name == "PathEltOrInverse":
             if isinstance(p.part, list):

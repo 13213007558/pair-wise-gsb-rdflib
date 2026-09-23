@@ -8,6 +8,8 @@ from __future__ import annotations  # noqa: I001
 
 import re
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any, BinaryIO
 from typing import TextIO, Union
 
@@ -19,6 +21,7 @@ from pyparsing import (
     Literal,
     OneOrMore,
     Optional,
+    ParseException,
     ParseResults,
     Regex,
     Suppress,
@@ -470,6 +473,56 @@ GraphNodePath = VarOrTerm | TriplesNodePath
 
 # [93] PathMod ::= '?' | '*' | '+'
 PathMod = Literal("?") | "*" | "+"
+
+# RDFLib extension: bounded repetition PathMod '{n}' / '{n,m}'
+# This is NOT part of SPARQL 1.1 and is only accepted when the
+# bounded_path_repeat extension is explicitly enabled, see parseQuery.
+_bounded_path_repeat_enabled = False
+
+
+@contextmanager
+def _bounded_path_repeat(enabled: bool) -> Generator[None, None, None]:
+    global _bounded_path_repeat_enabled
+    previous = _bounded_path_repeat_enabled
+    _bounded_path_repeat_enabled = enabled
+    try:
+        yield
+    finally:
+        _bounded_path_repeat_enabled = previous
+
+
+def _validate_bounded_path_mod(instring: str, loc: int, toks: ParseResults) -> None:
+    if not _bounded_path_repeat_enabled:
+        raise ParseException(
+            instring,
+            loc,
+            "Bounded path repetition '{n}' / '{n,m}' is an RDFLib extension "
+            + "and is not valid SPARQL 1.1; pass bounded_path_repeat=True "
+            + "to enable it",
+        )
+    mod = toks[0]
+    if mod.max is not None and mod.max < mod.min:
+        raise ParseException(
+            instring,
+            loc,
+            "Invalid bounded path repetition: max (%s) is smaller than min (%s)"
+            % (mod.max, mod.min),
+        )
+
+
+_BoundedPathCount = Regex(r"[0-9]+")
+_BoundedPathCount.set_parse_action(lambda toks: int(toks[0]))
+
+BoundedPathMod = Comp(
+    "BoundedPathMod",
+    Suppress("{")
+    + Param("min", _BoundedPathCount)
+    + Optional(Suppress(",") + Param("max", _BoundedPathCount))
+    + Suppress("}"),
+)
+BoundedPathMod.add_parse_action(_validate_bounded_path_mod)
+
+PathMod = PathMod | BoundedPathMod
 
 # [96] PathOneInPropertySet ::= iri | A | '^' ( iri | A )
 PathOneInPropertySet = iri | A | Comp("InversePath", "^" + (iri | A))
@@ -1545,17 +1598,38 @@ def expandUnicodeEscapes(q: str) -> str:
     return expandUnicodeEscapes_re.sub(expand, q)
 
 
-def parseQuery(q: Union[str, bytes, TextIO, BinaryIO]) -> ParseResults:
+def parseQuery(
+    q: Union[str, bytes, TextIO, BinaryIO], bounded_path_repeat: bool = False
+) -> ParseResults:
+    """
+    Parse a SPARQL 1.1 query string.
+
+    If `bounded_path_repeat` is true, the RDFLib extension for bounded
+    path repetition (`elt{n}` / `elt{n,m}`) is accepted in property
+    paths. By default the extension is disabled and such paths are
+    rejected as invalid SPARQL 1.1.
+    """
     if hasattr(q, "read"):
         q = q.read()
     if isinstance(q, bytes):
         q = q.decode("utf-8")
 
     q = expandUnicodeEscapes(q)
-    return Query.parse_string(q, parse_all=True)
+    with _bounded_path_repeat(bounded_path_repeat):
+        return Query.parse_string(q, parse_all=True)
 
 
-def parseUpdate(q: Union[str, bytes, TextIO, BinaryIO]) -> CompValue:
+def parseUpdate(
+    q: Union[str, bytes, TextIO, BinaryIO], bounded_path_repeat: bool = False
+) -> CompValue:
+    """
+    Parse a SPARQL 1.1 update string.
+
+    If `bounded_path_repeat` is true, the RDFLib extension for bounded
+    path repetition (`elt{n}` / `elt{n,m}`) is accepted in property
+    paths. By default the extension is disabled and such paths are
+    rejected as invalid SPARQL 1.1.
+    """
     if hasattr(q, "read"):
         q = q.read()
 
@@ -1563,4 +1637,5 @@ def parseUpdate(q: Union[str, bytes, TextIO, BinaryIO]) -> CompValue:
         q = q.decode("utf-8")
 
     q = expandUnicodeEscapes(q)
-    return UpdateUnit.parse_string(q, parse_all=True)[0]
+    with _bounded_path_repeat(bounded_path_repeat):
+        return UpdateUnit.parse_string(q, parse_all=True)[0]

@@ -21,6 +21,7 @@ __all__ = [
 
 
 from typing import Literal as PyLiteral
+from typing import Union
 
 _NamespaceSetString = PyLiteral["core", "rdflib", "none"]
-_MulPathMod = PyLiteral["*", "+", "?"]
+_MulPathMod = Union[PyLiteral["*", "+", "?"], tuple[int, int]]

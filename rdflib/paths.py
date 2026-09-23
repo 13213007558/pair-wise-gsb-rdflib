@@ -14,6 +14,8 @@ In SPARQL the syntax is as follows:
 | `elt*`              | A path that connects subject and object by zero or more matches of `elt`.|
 | `elt+`              | A path that connects subject and object by one or more matches of `elt`.|
 | `elt?`              | A path that connects subject and object by zero or one matches of `elt`.|
+| `elt{n}`            | (RDFLib extension) A path that connects subject and object by exactly `n` matches of `elt`.|
+| `elt{n,m}`          | (RDFLib extension) A path that connects subject and object by between `n` and `m` (inclusive) matches of `elt`.|
 | `!iri` or <br> `!(iri1 \| ... \| irin)` | Negated property set. An IRI not among `iri1` to `irin`. <br> `!iri` is short for `!(iri)`. |
 | `!^iri` or <br> `!(^iri1 \| ... \| ^irin)` | Negated reverse property set. Excludes `^iri1` to `^irin` as reverse paths. <br> `!^iri` is short for `!(^iri)`. |
 | `!(iri1 \| ... \| irij \| ^irij+1 \| ... \| ^irin)` | A combination of forward and reverse properties in a negated property set. |
@@ -46,6 +48,15 @@ the strings '\*', '?', '+', also defined as constants in this file.
 ```python
 >>> FOAF.knows*OneOrMore
 Path(http://xmlns.com/foaf/0.1/knows+)
+
+```
+
+The bounded repetition modifiers (`{n}`, `{n,m}`) are an RDFLib
+extension and are constructed by multiplying with a `(min, max)` tuple:
+
+```python
+>>> FOAF.knows*(2, 5)
+Path(http://xmlns.com/foaf/0.1/knows{2,5})
 
 ```
 
@@ -217,7 +228,7 @@ class Path(ABC):
     __invert__: Callable[[Path], InvPath]
     __neg__: Callable[[Path], NegatedPath]
     __truediv__: Callable[[Path, Union[URIRef, Path]], SequencePath]
-    __mul__: Callable[[Path, str], MulPath]
+    __mul__: Callable[[Path, _MulPathMod], Union[MulPath, BoundedPath]]
 
     @abstractmethod
     def eval(
@@ -471,6 +482,139 @@ class MulPath(Path):
         return "%s%s" % (_n3(self.path, namespace_manager), self.mod)
 
 
+class BoundedPath(Path):
+    """
+    A bounded repetition path, matching between `min` and `max`
+    (both inclusive) occurrences of `path`.
+
+    This is an RDFLib extension to the SPARQL 1.1 property paths,
+    corresponding to the `elt{min,max}` / `elt{n}` syntax.
+    """
+
+    def __init__(self, path: Union[Path, URIRef], min: int, max: int):
+        if not isinstance(min, int) or not isinstance(max, int):
+            raise ValueError(
+                "BoundedPath min and max must both be integers, "
+                + "got: min=%r, max=%r" % (min, max)
+            )
+        if min < 0 or max < 0:
+            raise ValueError(
+                "BoundedPath min and max must be non-negative, "
+                + "got: min=%r, max=%r" % (min, max)
+            )
+        if max < min:
+            raise ValueError(
+                "BoundedPath max must not be smaller than min, "
+                + "got: min=%r, max=%r" % (min, max)
+            )
+        self.path = path
+        self.min = min
+        self.max = max
+
+    def eval(
+        self,
+        graph: Graph,
+        subj: Optional[_SubjectType] = None,
+        obj: Optional[_ObjectType] = None,
+    ) -> Generator[tuple[_SubjectType, _ObjectType], None, None]:
+        done: set[tuple[_SubjectType, _ObjectType]] = set()
+
+        if self.min == 0:
+            # zero occurrences: like the zero case of "*", the path
+            # connects every node to itself
+            if subj is not None and obj is not None:
+                if subj == obj:
+                    done.add((subj, obj))
+                    yield subj, obj
+            elif subj is not None:
+                done.add((subj, subj))
+                yield subj, subj
+            elif obj is not None:
+                done.add((obj, obj))
+                yield obj, obj
+            else:
+                # According to the spec, ALL nodes are possible solutions
+                # (even literals)
+                seen_nodes = set()
+                for s, o in graph.subject_objects(None):
+                    if s not in seen_nodes:
+                        seen_nodes.add(s)
+                        done.add((s, s))
+                        yield s, s
+                    if o not in seen_nodes:
+                        seen_nodes.add(o)
+                        done.add((o, o))
+                        yield o, o
+
+        if self.max == 0:
+            return
+
+        if subj is not None:
+            yield from self._fwd(graph, subj, obj, done)
+        elif obj is not None:
+            yield from self._bwd(graph, obj, subj, done)
+        else:
+            starts = set()
+            for s, o in eval_path(graph, (None, self.path, None)):
+                if s not in starts:
+                    starts.add(s)
+                    yield from self._fwd(graph, s, None, done)
+
+    def _fwd(
+        self,
+        graph: Graph,
+        subj: _SubjectType,
+        obj: Optional[_ObjectType],
+        done: set[tuple[_SubjectType, _ObjectType]],
+    ) -> Generator[tuple[_SubjectType, _ObjectType], None, None]:
+        # breadth-first over the number of repetitions; the finite max
+        # bound guarantees termination even when the graph has cycles
+        frontier = {subj}
+        depth = 0
+        while frontier and depth < self.max:
+            depth += 1
+            next_frontier = set()
+            for node in frontier:
+                for s, o in eval_path(graph, (node, self.path, None)):
+                    if depth >= self.min and (obj is None or o == obj):
+                        if (subj, o) not in done:
+                            done.add((subj, o))
+                            yield subj, o
+                    next_frontier.add(o)
+            frontier = next_frontier
+
+    def _bwd(
+        self,
+        graph: Graph,
+        obj: _ObjectType,
+        subj: Optional[_SubjectType],
+        done: set[tuple[_SubjectType, _ObjectType]],
+    ) -> Generator[tuple[_SubjectType, _ObjectType], None, None]:
+        frontier = {obj}
+        depth = 0
+        while frontier and depth < self.max:
+            depth += 1
+            next_frontier = set()
+            for node in frontier:
+                for s, o in eval_path(graph, (None, self.path, node)):
+                    if depth >= self.min and (subj is None or s == subj):
+                        if (s, obj) not in done:
+                            done.add((s, obj))
+                            yield s, obj
+                    next_frontier.add(s)
+            frontier = next_frontier
+
+    def __repr__(self) -> str:
+        if self.min == self.max:
+            return "Path(%s{%s})" % (self.path, self.min)
+        return "Path(%s{%s,%s})" % (self.path, self.min, self.max)
+
+    def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
+        if self.min == self.max:
+            return "%s{%s}" % (_n3(self.path, namespace_manager), self.min)
+        return "%s{%s,%s}" % (_n3(self.path, namespace_manager), self.min, self.max)
+
+
 class NegatedPath(Path):
     def __init__(self, arg: Union[AlternativePath, InvPath, URIRef]):
         self.args: list[Union[URIRef, Path]]
@@ -556,10 +700,16 @@ def eval_path(
     return ((s, o) for s, p, o in graph.triples(t))
 
 
-def mul_path(p: Union[URIRef, Path], mul: _MulPathMod) -> MulPath:
+def mul_path(p: Union[URIRef, Path], mul: _MulPathMod) -> Union[MulPath, BoundedPath]:
     """
     cardinality path
+
+    Multiplying with one of the strings '*', '+' or '?' gives a
+    MulPath, multiplying with a (min, max) tuple of non-negative
+    integers gives a BoundedPath (an RDFLib extension).
     """
+    if isinstance(mul, tuple):
+        return BoundedPath(p, *mul)
     return MulPath(p, mul)
 
 
