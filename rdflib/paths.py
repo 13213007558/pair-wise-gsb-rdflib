@@ -49,6 +49,16 @@ Path(http://xmlns.com/foaf/0.1/knows+)
 
 ```
 
+A non-standard extension also allows bounded repetition with a
+``(min, max)`` tuple, matching the SPARQL extension syntax
+``elt{n}`` / ``elt{n,m}`` (see :mod:`rdflib.plugins.sparql.parser`):
+
+```python
+>>> FOAF.knows*(2, 5)
+Path(http://xmlns.com/foaf/0.1/knows{2,5})
+
+```
+
 The path objects can also be used with the normal graph methods.
 
 First some example data:
@@ -217,7 +227,7 @@ class Path(ABC):
     __invert__: Callable[[Path], InvPath]
     __neg__: Callable[[Path], NegatedPath]
     __truediv__: Callable[[Path, Union[URIRef, Path]], SequencePath]
-    __mul__: Callable[[Path, str], MulPath]
+    __mul__: Callable[[Path, _MulPathMod], MulPath]
 
     @abstractmethod
     def eval(
@@ -350,7 +360,6 @@ class AlternativePath(Path):
 class MulPath(Path):
     def __init__(self, path: Union[Path, URIRef], mod: _MulPathMod):
         self.path = path
-        self.mod = mod
 
         if mod == ZeroOrOne:
             self.zero = True
@@ -361,8 +370,49 @@ class MulPath(Path):
         elif mod == OneOrMore:
             self.zero = False
             self.more = True
+        elif isinstance(mod, tuple):
+            mod = self._validate_range(mod)
+            self.zero = mod[0] == 0
+            self.more = True
         else:
             raise Exception("Unknown modifier %s" % mod)
+
+        self.mod = mod
+
+    @staticmethod
+    def _validate_range(mod: tuple[int, int]) -> tuple[int, int]:
+        """
+        Validate a bounded repetition modifier ``(min, max)``.
+
+        Invalid ranges (negative counts, an inverted range, or a missing
+        upper bound) are rejected here, i.e. before the path is evaluated.
+        """
+        if len(mod) != 2:
+            raise ValueError(
+                "A range modifier must be a (min, max) tuple, got: %r" % (mod,)
+            )
+        lo, hi = mod
+        if not isinstance(lo, int) or isinstance(lo, bool) or lo < 0:
+            raise ValueError(
+                "Invalid minimum repetition count %r, "
+                "expected a non-negative integer" % (lo,)
+            )
+        if hi is None:
+            raise ValueError(
+                "Invalid repetition range %r, the upper bound is missing. "
+                "Use OneOrMore/ZeroOrMore for unbounded repetition." % (mod,)
+            )
+        if not isinstance(hi, int) or isinstance(hi, bool) or hi < 0:
+            raise ValueError(
+                "Invalid maximum repetition count %r, "
+                "expected a non-negative integer" % (hi,)
+            )
+        if hi < lo:
+            raise ValueError(
+                "Invalid repetition range %r, the upper bound is smaller "
+                "than the lower bound" % (mod,)
+            )
+        return (lo, hi)
 
     def eval(
         self,
@@ -371,6 +421,10 @@ class MulPath(Path):
         obj: Optional[_ObjectType] = None,
         first: bool = True,
     ) -> Generator[tuple[_SubjectType, _ObjectType], None, None]:
+        if isinstance(self.mod, tuple):
+            yield from self._eval_range(graph, subj, obj)
+            return
+
         if self.zero and first:
             if subj and obj:
                 if subj == obj:
@@ -464,11 +518,101 @@ class MulPath(Path):
                     done.add(x)
                     yield x
 
+    def _eval_range(
+        self,
+        graph: Graph,
+        subj: Optional[_SubjectType] = None,
+        obj: Optional[_ObjectType] = None,
+    ) -> Generator[tuple[_SubjectType, _ObjectType], None, None]:
+        """
+        Evaluate a bounded repetition ``path{min, max}``.
+
+        Layers of nodes reachable in exactly ``d`` steps are computed
+        breadth-first, so cycles cannot loop forever and every endpoint
+        reachable with between ``min`` and ``max`` (inclusive) applications
+        of the inner path is found. Endpoints reached via paths of different
+        lengths are only returned once. A ``min`` of zero yields the
+        zero-length (identity) pairs, exactly like ``*``.
+        """
+        lo, hi = self.mod  # type: ignore[misc]
+        done: set[tuple[_SubjectType, _ObjectType]] = set()
+
+        def _layer(frontier: set[Node], reverse: bool) -> set[Node]:
+            # nodes reachable in exactly one more application of the path
+            nxt: set[Node] = set()
+            for node in frontier:
+                if reverse:
+                    for s, _o in eval_path(graph, (None, self.path, node)):
+                        nxt.add(s)
+                else:
+                    for _s, o in eval_path(graph, (node, self.path, None)):
+                        nxt.add(o)
+            return nxt
+
+        def _reachable(start: Node, reverse: bool) -> Generator[Node, None, None]:
+            # endpoints reachable from start in d steps, lo <= d <= hi
+            frontier: set[Node] = {start}
+            if lo == 0:
+                yield start
+            depth = 0
+            while depth < hi and frontier:
+                frontier = _layer(frontier, reverse)
+                depth += 1
+                if depth >= lo:
+                    yield from frontier
+
+        if subj is None and obj is not None:
+            # walk backwards from the fixed object
+            for s in _reachable(obj, reverse=True):
+                if (s, obj) not in done:
+                    done.add((s, obj))
+                    yield s, obj
+            return
+
+        if subj is not None:
+            starts: Iterator[_SubjectType] = iter([subj])
+        else:
+            # no vars bound, every node is a possible starting point
+            seen_starts: set[Node] = set()
+
+            def _all_starts() -> Generator[_SubjectType, None, None]:
+                for s, _o in eval_path(graph, (None, self.path, None)):
+                    if s not in seen_starts:
+                        seen_starts.add(s)
+                        yield s
+
+            starts = _all_starts()
+            if lo == 0:
+                # as for *, ALL nodes are zero-length endpoints
+                seen_zero: set[Node] = set()
+                for s, o in graph.subject_objects(None):
+                    for n in (s, o):
+                        if n not in seen_zero:
+                            seen_zero.add(n)
+                            done.add((n, n))
+                            yield n, n  # type: ignore[misc]
+
+        for start in starts:
+            for o in _reachable(start, reverse=False):
+                if obj is not None and o != obj:
+                    continue
+                if (start, o) not in done:
+                    done.add((start, o))
+                    yield start, o
+
+    def _mod_n3(self) -> str:
+        if isinstance(self.mod, tuple):
+            lo, hi = self.mod
+            if lo == hi:
+                return "{%d}" % lo
+            return "{%d,%d}" % (lo, hi)
+        return self.mod
+
     def __repr__(self) -> str:
-        return "Path(%s%s)" % (self.path, self.mod)
+        return "Path(%s%s)" % (self.path, self._mod_n3())
 
     def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
-        return "%s%s" % (_n3(self.path, namespace_manager), self.mod)
+        return "%s%s" % (_n3(self.path, namespace_manager), self._mod_n3())
 
 
 class NegatedPath(Path):

@@ -20,6 +20,7 @@ from pyparsing import (
     OneOrMore,
     Optional,
     ParseResults,
+    ParseSyntaxException,
     Regex,
     Suppress,
     ZeroOrMore,
@@ -36,6 +37,29 @@ from .parserutils import Comp, CompValue, Param, ParamList
 
 
 DEBUG = False
+
+#: Non-standard extension switch.
+#:
+#: When True, the parser accepts bounded-repetition property path
+#: modifiers ``{n}`` and ``{n,m}`` (e.g. ``(ex:parent/ex:parent){2,5}``)
+#: in addition to the standard SPARQL 1.1 modifiers ``?``, ``*`` and ``+``.
+#: It is False by default, so plain SPARQL parsing rejects the extension
+#: syntax. Toggle it with :func:`enable_bounded_path_repetition`.
+BOUNDED_PATH_REPETITION_ENABLED = False
+
+
+def enable_bounded_path_repetition(enabled: bool = True) -> None:
+    """
+    Enable or disable the non-standard bounded-repetition property path
+    modifiers ``{n}`` / ``{n,m}``.
+
+    The counts apply to the whole preceding path element, e.g.
+    ``(ex:parent/ex:parent){2,5}`` matches two to five repetitions of the
+    sequence ``ex:parent/ex:parent``. A missing upper bound (``{2,}``),
+    negative counts and inverted ranges (``{5,2}``) are rejected.
+    """
+    global BOUNDED_PATH_REPETITION_ENABLED
+    BOUNDED_PATH_REPETITION_ENABLED = enabled
 
 # ---------------- ACTIONS
 
@@ -468,8 +492,41 @@ GraphNode = VarOrTerm | TriplesNode
 GraphNodePath = VarOrTerm | TriplesNodePath
 
 
+def _path_mod_range(s: str, l: int, tokens: ParseResults) -> list[tuple[int, int]]:
+    """
+    Parse action for the non-standard bounded repetition modifier
+    ``{n}`` / ``{n,m}``. Produces a ``(min, max)`` tuple for MulPath.
+    """
+    if not BOUNDED_PATH_REPETITION_ENABLED:
+        # a ParseSyntaxException so the message survives the Comp/Param
+        # wrappers, which rewrite the message of other parse exceptions
+        raise ParseSyntaxException(
+            s,
+            l,
+            "Bounded path repetition modifiers '{n}' and '{n,m}' are a "
+            "non-standard extension and are not enabled; use "
+            "rdflib.plugins.sparql.parser.enable_bounded_path_repetition() "
+            "to enable them",
+        )
+    lo = int(tokens[0])
+    hi = int(tokens[1]) if len(tokens) > 1 else lo
+    return [(lo, hi)]
+
+
+# Non-standard extension: bounded repetition, '{n}' or '{n,m}'.
+# '{n,}' (missing upper bound) and negative counts do not match and are
+# rejected as parse errors; inverted ranges are rejected when the
+# resulting MulPath is created.
+PathModRange = (
+    Suppress("{")
+    + Regex(r"[0-9]+")
+    + Optional(Suppress(",") + Regex(r"[0-9]+"))
+    + Suppress("}")
+).set_parse_action(_path_mod_range)
+
 # [93] PathMod ::= '?' | '*' | '+'
-PathMod = Literal("?") | "*" | "+"
+# (extended with the non-standard '{n}' / '{n,m}' range modifier)
+PathMod = Literal("?") | "*" | "+" | PathModRange
 
 # [96] PathOneInPropertySet ::= iri | A | '^' ( iri | A )
 PathOneInPropertySet = iri | A | Comp("InversePath", "^" + (iri | A))
