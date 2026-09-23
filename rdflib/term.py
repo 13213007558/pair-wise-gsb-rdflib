@@ -36,6 +36,7 @@ __all__ = [
     "BNode",
     "Literal",
     "Variable",
+    "QuotedTriple",
 ]
 import logging
 import math
@@ -2362,12 +2363,196 @@ class Variable(Identifier):
         return (Variable, (str(self),))
 
 
+class QuotedTriple(Node):
+    """
+    An RDF-star quoted (embedded) triple term.
+
+    A quoted triple denotes a triple without asserting it, so it can be
+    used as the subject or object of another triple, e.g. to state the
+    provenance of a claim::
+
+        << <http://example/s> <http://example/p> "42"^^xsd:integer >>
+            <http://example/source> <http://example/systemA> .
+
+    Quoted triples may be nested to arbitrary depth, i.e. the subject or
+    object of a quoted triple may itself be a quoted triple.
+
+    The components follow the usual RDF rules for triples: the subject must
+    be an IRI, blank node or another quoted triple, the predicate must be an
+    IRI and the object may be any RDF term (including a quoted triple).
+    [`Variable`][rdflib.term.Variable] components are additionally permitted
+    so that quoted triples can be used as SPARQL-star triple patterns.
+
+    Equality and hashing are structural: two quoted triples are equal if and
+    only if their subjects, predicates and objects are equal, consistent with
+    the contract of the other RDF term classes.
+    """
+
+    __slots__ = ("_subject", "_predicate", "_object")
+
+    def __init__(self, *args: Any) -> None:
+        if len(args) == 1:
+            triple = args[0]
+            if not isinstance(triple, (tuple, list)) or len(triple) != 3:
+                raise TypeError(
+                    "QuotedTriple expects a (subject, predicate, object) "
+                    "triple, got: %r" % (triple,)
+                )
+            subject, predicate, object_ = triple
+        elif len(args) == 3:
+            subject, predicate, object_ = args
+        else:
+            raise TypeError(
+                "QuotedTriple expects either a single (subject, predicate, "
+                "object) triple or three separate arguments, got %d arguments"
+                % len(args)
+            )
+
+        if not isinstance(subject, (URIRef, BNode, QuotedTriple, Variable)):
+            raise ValueError(
+                "Subject of a quoted triple must be a URIRef, BNode or "
+                "QuotedTriple, got: %r" % (subject,)
+            )
+        if not isinstance(predicate, (URIRef, Variable)):
+            raise ValueError(
+                "Predicate of a quoted triple must be a URIRef, got: %r"
+                % (predicate,)
+            )
+        if not isinstance(object_, Node):
+            raise ValueError(
+                "Object of a quoted triple must be an rdflib term, got: %r"
+                % (object_,)
+            )
+
+        self._subject = subject
+        self._predicate = predicate
+        self._object = object_
+
+    @property
+    def subject(self) -> Node:
+        return self._subject
+
+    @property
+    def predicate(self) -> Node:
+        return self._predicate
+
+    @property
+    def object(self) -> Node:
+        return self._object
+
+    @property
+    def triple(self) -> tuple[Node, Node, Node]:
+        return (self._subject, self._predicate, self._object)
+
+    def __repr__(self) -> str:
+        if self.__class__ is QuotedTriple:
+            clsName = "rdflib.term.QuotedTriple"  # noqa: N806
+        else:
+            clsName = self.__class__.__name__  # noqa: N806
+        return "%s((%r, %r, %r))" % (
+            clsName,
+            self._subject,
+            self._predicate,
+            self._object,
+        )
+
+    def __str__(self) -> str:
+        return self.n3()
+
+    def __eq__(self, other: Any) -> bool:
+        """Equality for quoted triples.
+
+        >>> abc = QuotedTriple((URIRef("a"), URIRef("b"), URIRef("c")))
+        >>> abd = QuotedTriple((URIRef("a"), URIRef("b"), URIRef("d")))
+        >>> abc == QuotedTriple((URIRef("a"), URIRef("b"), URIRef("c")))
+        True
+        >>> abc == abd
+        False
+        >>> abc == (URIRef("a"), URIRef("b"), URIRef("c"))
+        False
+        >>> abc == None
+        False
+        """
+        if isinstance(other, QuotedTriple):
+            return (
+                self._subject == other._subject
+                and self._predicate == other._predicate
+                and self._object == other._object
+            )
+        return False
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    def eq(self, other: Any) -> bool:
+        """A "semantic"/interpreted equality function,
+        by default, same as __eq__"""
+        return self.__eq__(other)
+
+    def neq(self, other: Any) -> bool:
+        """A "semantic"/interpreted not equal function,
+        by default, same as __ne__"""
+        return self.__ne__(other)
+
+    def __hash__(self) -> int:
+        return hash((QuotedTriple, self._subject, self._predicate, self._object))
+
+    def _ordering_key(self) -> tuple[Node, Node, Node]:
+        return (self._subject, self._predicate, self._object)
+
+    def __lt__(self, other: Any) -> bool:
+        if other is None:
+            return False  # Nothing is less than None
+        elif isinstance(other, QuotedTriple):
+            return self._ordering_key() < other._ordering_key()
+        elif isinstance(other, Node):
+            return _ORDERING[QuotedTriple] < _ORDERING[type(other)]
+        return NotImplemented
+
+    def __gt__(self, other: Any) -> bool:
+        if other is None:
+            return True  # everything bigger than None
+        elif isinstance(other, QuotedTriple):
+            return self._ordering_key() > other._ordering_key()
+        elif isinstance(other, Node):
+            return _ORDERING[QuotedTriple] > _ORDERING[type(other)]
+        return NotImplemented
+
+    def __le__(self, other: Any) -> bool:
+        r = self.__lt__(other)
+        if r:
+            return True
+        return self == other
+
+    def __ge__(self, other: Any) -> bool:
+        r = self.__gt__(other)
+        if r:
+            return True
+        return self == other
+
+    def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
+        """Return a Turtle-star/N-Triples-star representation of this
+        quoted triple, preserving nesting, literal escaping, datatypes and
+        language tags."""
+        return "<< %s %s %s >>" % (
+            self._subject.n3(namespace_manager),
+            self._predicate.n3(namespace_manager),
+            self._object.n3(namespace_manager),
+        )
+
+    def toPython(self) -> QuotedTriple:  # noqa: N802
+        return self
+
+    def __reduce__(self) -> tuple[type[QuotedTriple], tuple[tuple[Node, Node, Node]]]:
+        return (QuotedTriple, ((self._subject, self._predicate, self._object),))
+
+
 # Nodes are ordered like this
 # See http://www.w3.org/TR/sparql11-query/#modOrderBy
 # we leave "space" for more subclasses of Node elsewhere
 # default-dict to grazefully fail for new subclasses
 _ORDERING: dict[type[Node], int] = defaultdict(int)
-_ORDERING.update({BNode: 10, Variable: 20, URIRef: 30, Literal: 40})
+_ORDERING.update({BNode: 10, Variable: 20, URIRef: 30, QuotedTriple: 35, Literal: 40})
 
 
 def _isEqualXMLNode(  # noqa: N802

@@ -22,7 +22,7 @@ from rdflib.exceptions import Error
 from rdflib.graph import Graph
 from rdflib.namespace import RDF, RDFS
 from rdflib.serializer import Serializer
-from rdflib.term import BNode, Literal, Node, URIRef
+from rdflib.term import BNode, Literal, Node, QuotedTriple, URIRef
 
 _StrT = TypeVar("_StrT", bound=str)
 
@@ -289,6 +289,9 @@ class TurtleSerializer(RecursiveSerializer):
     def preprocessTriple(self, triple: _TripleType) -> None:
         super(TurtleSerializer, self).preprocessTriple(triple)
         for i, node in enumerate(triple):
+            if isinstance(node, QuotedTriple):
+                self._preprocessQuotedTriple(node)
+                continue
             if i == VERB:
                 if node in self.keywords:
                     # predicate is a keyword
@@ -309,6 +312,16 @@ class TurtleSerializer(RecursiveSerializer):
         p = triple[1]
         if isinstance(p, BNode):  # hmm - when is P ever a bnode?
             self._references[p] += 1
+
+    def _preprocessQuotedTriple(self, quoted: QuotedTriple) -> None:
+        """Register namespaces for the terms inside a quoted triple."""
+        for i, node in enumerate(quoted.triple):
+            if isinstance(node, QuotedTriple):
+                self._preprocessQuotedTriple(node)
+                continue
+            self.get_pname(node, gen_prefix=(i == VERB))
+            if isinstance(node, Literal) and node.datatype:
+                self.get_pname(node.datatype, gen_prefix=_GEN_QNAME_FOR_DT)
 
     # Refer to Productions for terminals PNAME_NS and PNAME_LN https://www.w3.org/TR/turtle/#sec-grammar-grammar
     def get_pname(self, uri: Node, gen_prefix: bool = True) -> Optional[str]:
@@ -411,6 +424,12 @@ class TurtleSerializer(RecursiveSerializer):
             return node._literal_n3(
                 use_plain=True,
                 qname_callback=lambda dt: self.get_pname(dt, _GEN_QNAME_FOR_DT),
+            )
+        if isinstance(node, QuotedTriple):
+            return "<< %s %s %s >>" % (
+                self.label(node.subject, SUBJECT),
+                self.label(node.predicate, VERB),
+                self.label(node.object, OBJECT),
             )
         else:
             node = self.relativize(node)  # type: ignore[type-var]

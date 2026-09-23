@@ -6,7 +6,7 @@ from typing import IO, TYPE_CHECKING, Any, Optional, Union
 
 from rdflib.graph import Graph
 from rdflib.serializer import Serializer
-from rdflib.term import Literal
+from rdflib.term import Literal, Node, QuotedTriple
 
 if TYPE_CHECKING:
     from rdflib.graph import _TripleType
@@ -56,10 +56,24 @@ class NT11Serializer(NTSerializer):
 
 
 def _nt_row(triple: _TripleType) -> str:
-    if isinstance(triple[2], Literal):
-        return f"{triple[0].n3()} {triple[1].n3()} {_quoteLiteral(triple[2])} .\n"
-    else:
-        return f"{triple[0].n3()} {triple[1].n3()} {triple[2].n3()} .\n"
+    return f"{_nt_term(triple[0])} {triple[1].n3()} {_nt_term(triple[2])} .\n"
+
+
+def _nt_term(node: Node) -> str:
+    """Serialize a single term in N-Triples-star syntax.
+
+    Quoted triples are emitted recursively as `<< ... >>`, preserving
+    nesting, literal escaping, datatypes and language tags.
+    """
+    if isinstance(node, QuotedTriple):
+        return "<< %s %s %s >>" % (
+            _nt_term(node.subject),
+            node.predicate.n3(),
+            _nt_term(node.object),
+        )
+    if isinstance(node, Literal):
+        return _quoteLiteral(node)
+    return node.n3()
 
 
 def _quoteLiteral(l_: Literal) -> str:  # noqa: N802

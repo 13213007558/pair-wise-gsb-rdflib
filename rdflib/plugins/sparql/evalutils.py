@@ -18,7 +18,7 @@ from rdflib.plugins.sparql.sparql import (
     QueryContext,
     SPARQLError,
 )
-from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
+from rdflib.term import BNode, Identifier, Literal, QuotedTriple, URIRef, Variable
 
 _ContextType = Union[FrozenBindings, QueryContext]
 _FrozenDictT = TypeVar("_FrozenDictT", bound=FrozenDict)
@@ -164,8 +164,47 @@ def _fillTemplate(
             bnodeMap[x] if isinstance(x, BNode) else y for x, y in zip(t, (_s, _p, _o))
         ]
 
+        # substitute variables and blank nodes inside quoted triples
+        _s, _p, _o = [
+            (
+                _fillQuotedTriple(x, solution, bnodeMap)
+                if isinstance(x, QuotedTriple)
+                else x
+            )
+            for x in (_s, _p, _o)
+        ]
+
         if _s is not None and _p is not None and _o is not None:
             yield (_s, _p, _o)
+
+
+def _fillQuotedTriple(
+    quoted: QuotedTriple,
+    solution: _ContextType,
+    bnodeMap: collections.defaultdict[BNode, BNode],
+) -> Union[QuotedTriple, None]:
+    """
+    Instantiate a quoted triple in a template with the bindings of a
+    solution. Returns None if any component cannot be instantiated, in
+    which case the enclosing template triple must be skipped.
+    """
+    components = []
+    for component in quoted.triple:
+        if isinstance(component, QuotedTriple):
+            filled = _fillQuotedTriple(component, solution, bnodeMap)
+            if filled is None:
+                return None
+            components.append(filled)
+        elif isinstance(component, BNode):
+            components.append(bnodeMap[component])
+        elif isinstance(component, Variable):
+            value = solution.get(component)
+            if value is None:
+                return None
+            components.append(value)
+        else:
+            components.append(component)
+    return QuotedTriple(tuple(components))
 
 
 _ValueT = TypeVar("_ValueT", Variable, BNode, URIRef, Literal)

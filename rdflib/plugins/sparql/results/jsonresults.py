@@ -15,7 +15,7 @@ from collections.abc import Mapping, MutableSequence
 from typing import IO, Any, Optional
 
 from rdflib.query import Result, ResultException, ResultParser, ResultSerializer
-from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
+from rdflib.term import BNode, Identifier, Literal, QuotedTriple, URIRef, Variable
 
 try:
     import orjson
@@ -145,6 +145,16 @@ def parseJsonTerm(d: dict[str, str]) -> Identifier:
         return Literal(d["value"], datatype=URIRef(d["datatype"]))
     elif t == "bnode":
         return BNode(d["value"])
+    elif t == "triple":
+        # RDF-star quoted triple (SPARQL-star JSON results)
+        value = d["value"]
+        return QuotedTriple(
+            (
+                parseJsonTerm(value["subject"]),
+                parseJsonTerm(value["predicate"]),
+                parseJsonTerm(value["object"]),
+            )
+        )
     else:
         raise NotImplementedError("json term type %r" % t)
 
@@ -165,6 +175,15 @@ def termToJSON(
 
     elif isinstance(term, BNode):
         return {"type": "bnode", "value": str(term)}
+    elif isinstance(term, QuotedTriple):
+        return {
+            "type": "triple",
+            "value": {
+                "subject": termToJSON(self, term.subject),
+                "predicate": termToJSON(self, term.predicate),
+                "object": termToJSON(self, term.object),
+            },
+        }
     elif term is None:
         return None
     else:

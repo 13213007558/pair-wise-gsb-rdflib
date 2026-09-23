@@ -59,6 +59,7 @@ from rdflib.term import (
     Identifier,
     Literal,
     Node,
+    QuotedTriple,
     URIRef,
     Variable,
     _unique_id,
@@ -400,6 +401,7 @@ class SinkParser:
         genPrefix: str = "",
         why: Optional[Callable[[], None]] = None,
         turtle: bool = False,
+        rdfstar: bool = True,
     ):
         """note: namespace names should *not* end in  # ;
         the  # will get added during qname processing"""
@@ -427,6 +429,7 @@ class SinkParser:
         self._reason = why  # Why the parser was asked to parse this
 
         self.turtle = turtle  # raise exception when encountering N3 extensions
+        self.rdfstar = rdfstar  # raise exception on RDF-star quoted triples if False
         # Turtle allows single or double quotes around strings, whereas N3
         # only allows double quotes.
         self.string_delimiters = ('"', "'") if turtle else ('"',)
@@ -938,6 +941,10 @@ class SinkParser:
         i = j
         ch = argstr[i]  # Quick 1-character checks first:
 
+        if ch == "<" and argstr[i + 1 : i + 2] == "<":
+            # RDF-star quoted triple: << subject predicate object >>
+            return self.quotedTriple(argstr, i, res)
+
         if ch == "[":
             bnodeID = self.here(i)
             j = self.skipSpace(argstr, i + 1)
@@ -1114,6 +1121,158 @@ class SinkParser:
                 return j
 
         return -1
+
+    def quotedTriple(self, argstr: str, i: int, res: MutableSequence[Any]) -> int:
+        """Parse an RDF-star quoted triple: `<< subject predicate object >>`.
+
+        The quoted triple is a term: parsing it does not assert the triple
+        in the graph. Quoted triples may be nested, i.e. the subject or
+        object may itself be a quoted triple.
+        """
+        if not self.rdfstar:
+            self.BadSyntax(
+                argstr,
+                i,
+                "Encountered an RDF-star quoted triple ('<< ... >>'), but "
+                "RDF-star support is disabled. Parse with rdfstar=True to "
+                "allow quoted triples.",
+            )
+        j, subj = self._quotedSubject(argstr, i + 2)
+        j, pred = self._quotedPredicate(argstr, j)
+        j, obj = self._quotedObject(argstr, j)
+        j = self.skipSpace(argstr, j)
+        if j < 0:
+            self.BadSyntax(argstr, i, "needed '>>', found end.")
+        if argstr[j : j + 2] != ">>":
+            self.BadSyntax(argstr, j, "expected '>>' to close quoted triple")
+        res.append(
+            QuotedTriple(
+                (
+                    self._store.normalise(self._context, subj),
+                    self._store.normalise(self._context, pred),
+                    self._store.normalise(self._context, obj),
+                )
+            )
+        )
+        return j + 2
+
+    def _quotedSubject(self, argstr: str, i: int) -> tuple[int, Node]:
+        j = self.skipSpace(argstr, i)
+        if j < 0:
+            self.BadSyntax(argstr, i, "EOF when quoted triple subject expected")
+        if argstr[j : j + 2] == "<<":
+            res: list[Any] = []
+            j = self.quotedTriple(argstr, j, res)
+            return j, res[0]
+        if argstr[j : j + 2] == "[]":
+            return j + 2, self.blankNode(uri=self.here(j))
+        res = []
+        k = self.uri_ref2(argstr, j, res)
+        if k < 0:
+            self.BadSyntax(
+                argstr,
+                j,
+                "expected iri, blank node or quoted triple as quoted "
+                "triple subject",
+            )
+        return k, res[0]
+
+    def _quotedPredicate(self, argstr: str, i: int) -> tuple[int, Node]:
+        j = self.skipSpace(argstr, i)
+        if j < 0:
+            self.BadSyntax(argstr, i, "EOF when quoted triple predicate expected")
+        k = self.tok("a", argstr, j)
+        if k >= 0:
+            return k, self._store.newSymbol(
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            )
+        res: list[Any] = []
+        k = self.uri_ref2(argstr, j, res)
+        if k < 0 or not isinstance(res[0], (URIRef, Variable)):
+            self.BadSyntax(argstr, j, "expected iri as quoted triple predicate")
+        return k, res[0]
+
+    def _quotedObject(self, argstr: str, i: int) -> tuple[int, Node]:
+        j = self.skipSpace(argstr, i)
+        if j < 0:
+            self.BadSyntax(argstr, i, "EOF when quoted triple object expected")
+        if argstr[j : j + 2] == "<<":
+            res: list[Any] = []
+            j = self.quotedTriple(argstr, j, res)
+            return j, res[0]
+        if argstr[j : j + 2] == "[]":
+            return j + 2, self.blankNode(uri=self.here(j))
+        res: list[Any] = []
+        k = self.uri_ref2(argstr, j, res)
+        if k >= 0:
+            return k, res[0]
+
+        startline = self.lines  # Remember where for error messages
+        ch = argstr[j]
+        if ch in numberCharsPlus:
+            m = exponent_syntax.match(argstr, j)
+            if m:
+                return m.end(), sfloat(argstr[j : m.end()])
+
+            m = decimal_syntax.match(argstr, j)
+            if m:
+                return m.end(), Decimal(argstr[j : m.end()])
+
+            m = integer_syntax.match(argstr, j)
+            if m:
+                return m.end(), long_type(argstr[j : m.end()])
+
+        if ch in self.string_delimiters:
+            ch_three = ch * 3
+            if argstr[j : j + 3] == ch_three:
+                delim = ch_three
+                j += 3
+            else:
+                delim = ch
+                j += 1
+
+            dt = None
+            k, s = self.strconst(argstr, j, delim)
+            lang = None
+            if argstr[k] == "@":  # Language?
+                m = langcode.match(argstr, k + 1)
+                if m is None:
+                    raise BadSyntax(
+                        self._thisDoc,
+                        startline,
+                        argstr,
+                        j,
+                        "Bad language code syntax on string literal, after @",
+                    )
+                lang = argstr[k + 1 : m.end()]
+                k = m.end()
+            if argstr[k : k + 2] == "^^":
+                res2: list[Any] = []
+                k = self.uri_ref2(argstr, k + 2, res2)  # Read datatype URI
+                if not res2:
+                    raise BadSyntax(
+                        self._thisDoc,
+                        startline,
+                        argstr,
+                        k,
+                        "Missing or invalid datatype IRI after '^^'",
+                    )
+                dt = res2[0]
+            return k, self._store.newLiteral(s, dt, lang)
+
+        k = self.tok("true", argstr, j)
+        if k >= 0:
+            return k, True
+        k = self.tok("false", argstr, j)
+        if k >= 0:
+            return k, False
+
+        self.BadSyntax(
+            argstr,
+            j,
+            "expected iri, blank node, literal or quoted triple as quoted "
+            "triple object",
+        )
 
     def property_list(self, argstr: str, i: int, subj: Node) -> int:
         """Parse property list
@@ -2031,6 +2190,7 @@ class TurtleParser(Parser):
         graph: Graph,
         encoding: Optional[str] = "utf-8",
         turtle: bool = True,
+        rdfstar: bool = True,
     ) -> None:
         if encoding not in [None, "utf-8"]:
             raise ParserError(
@@ -2040,7 +2200,7 @@ class TurtleParser(Parser):
         sink = RDFSink(graph)
 
         baseURI = graph.absolutize(source.getPublicId() or source.getSystemId() or "")
-        p = SinkParser(sink, baseURI=baseURI, turtle=turtle)
+        p = SinkParser(sink, baseURI=baseURI, turtle=turtle, rdfstar=rdfstar)
         # N3 parser prefers str stream
         stream: Reader[str] | Reader[bytes] | None = cast(
             "Reader[str]", source.getCharacterStream()

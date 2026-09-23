@@ -25,7 +25,7 @@ from rdflib.compare import to_canonical_graph
 from rdflib.exceptions import Error
 from rdflib.graph import Graph, _TripleType
 from rdflib.namespace import RDF
-from rdflib.term import BNode, Literal, URIRef
+from rdflib.term import BNode, Literal, QuotedTriple, URIRef
 
 from .turtle import RecursiveSerializer
 
@@ -153,6 +153,9 @@ class LongTurtleSerializer(RecursiveSerializer):
     def preprocessTriple(self, triple: _TripleType) -> None:
         super(LongTurtleSerializer, self).preprocessTriple(triple)
         for i, node in enumerate(triple):
+            if isinstance(node, QuotedTriple):
+                self._preprocessQuotedTriple(node)
+                continue
             if i == VERB:
                 if node in self.keywords:
                     # predicate is a keyword
@@ -173,6 +176,16 @@ class LongTurtleSerializer(RecursiveSerializer):
         p = triple[1]
         if isinstance(p, BNode):  # hmm - when is P ever a bnode?
             self._references[p] += 1
+
+    def _preprocessQuotedTriple(self, quoted: QuotedTriple) -> None:
+        """Register namespaces for the terms inside a quoted triple."""
+        for i, node in enumerate(quoted.triple):
+            if isinstance(node, QuotedTriple):
+                self._preprocessQuotedTriple(node)
+                continue
+            self.get_pname(node, gen_prefix=(i == VERB))
+            if isinstance(node, Literal) and node.datatype:
+                self.get_pname(node.datatype, gen_prefix=_GEN_QNAME_FOR_DT)
 
     def get_pname(self, uri, gen_prefix=True):
         if not isinstance(uri, URIRef):
@@ -272,6 +285,12 @@ class LongTurtleSerializer(RecursiveSerializer):
             return node._literal_n3(
                 use_plain=True,
                 qname_callback=lambda dt: self.get_pname(dt, _GEN_QNAME_FOR_DT),
+            )
+        if isinstance(node, QuotedTriple):
+            return "<< %s %s %s >>" % (
+                self.label(node.subject, SUBJECT),
+                self.label(node.predicate, VERB),
+                self.label(node.object, OBJECT),
             )
         else:
             node = self.relativize(node)

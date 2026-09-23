@@ -29,7 +29,7 @@ from xml.sax.saxutils import XMLGenerator
 from xml.sax.xmlreader import AttributesNSImpl
 
 from rdflib.query import Result, ResultException, ResultParser, ResultSerializer
-from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
+from rdflib.term import BNode, Identifier, Literal, QuotedTriple, URIRef, Variable
 
 try:
     # https://adamj.eu/tech/2021/12/29/python-type-hints-optional-imports/
@@ -125,10 +125,16 @@ class XMLResult(Result):
             self.askAnswer = boolean.text.lower().strip() == "true"  # type: ignore[union-attr]
 
 
-def parseTerm(element: xml_etree.Element) -> Union[URIRef, Literal, BNode]:
-    """rdflib object (Literal, URIRef, BNode) for the given
+def parseTerm(element: xml_etree.Element) -> Union[URIRef, Literal, BNode, QuotedTriple]:
+    """rdflib object (Literal, URIRef, BNode, QuotedTriple) for the given
     elementtree element"""
     tag, text = element.tag, element.text
+    if tag == RESULTS_NS_ET + "triple":
+        # RDF-star quoted triple (SPARQL-star XML results)
+        children = list(element)
+        if len(children) != 3:
+            raise TypeError("quoted triple binding must have 3 terms: %r" % element)
+        return QuotedTriple(tuple(parseTerm(child) for child in children))
     if tag == RESULTS_NS_ET + "literal":
         if text is None:
             text = ""
@@ -259,6 +265,11 @@ class SPARQLXMLWriter:
             AttributesNSImpl(attr_vals, attr_qnames),  # type: ignore[arg-type, unused-ignore]
         )
 
+        self._write_term(val)
+
+        self.writer.endElementNS((SPARQL_XML_NAMESPACE, "binding"), "binding")
+
+    def _write_term(self, val: Identifier) -> None:
         if isinstance(val, URIRef):
             self.writer.startElementNS(
                 (SPARQL_XML_NAMESPACE, "uri"), "uri", AttributesNSImpl({}, {})
@@ -272,8 +283,8 @@ class SPARQLXMLWriter:
             self.writer.characters(val)
             self.writer.endElementNS((SPARQL_XML_NAMESPACE, "bnode"), "bnode")
         elif isinstance(val, Literal):
-            attr_vals = {}
-            attr_qnames = {}
+            attr_vals: dict[tuple[Optional[str], str], str] = {}
+            attr_qnames: dict[tuple[Optional[str], str], str] = {}
             if val.language:
                 attr_vals[(XML_NAMESPACE, "lang")] = val.language
                 attr_qnames[(XML_NAMESPACE, "lang")] = "xml:lang"
@@ -291,10 +302,17 @@ class SPARQLXMLWriter:
             self.writer.characters(val)
             self.writer.endElementNS((SPARQL_XML_NAMESPACE, "literal"), "literal")
 
+        elif isinstance(val, QuotedTriple):
+            # RDF-star quoted triple (SPARQL-star XML results)
+            self.writer.startElementNS(
+                (SPARQL_XML_NAMESPACE, "triple"), "triple", AttributesNSImpl({}, {})
+            )
+            for component in val.triple:
+                self._write_term(component)
+            self.writer.endElementNS((SPARQL_XML_NAMESPACE, "triple"), "triple")
+
         else:
             raise Exception("Unsupported RDF term: %s" % val)
-
-        self.writer.endElementNS((SPARQL_XML_NAMESPACE, "binding"), "binding")
 
     def close(self) -> None:
         if self._results:

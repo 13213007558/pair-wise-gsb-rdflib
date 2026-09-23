@@ -35,7 +35,7 @@ from rdflib.plugins.sparql.sparql import Prologue, Query, Update
 
 # ---------------------------
 # Some convenience methods
-from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
+from rdflib.term import BNode, Identifier, Literal, QuotedTriple, URIRef, Variable
 
 
 def OrderBy(p: CompValue, expr: list[CompValue]) -> CompValue:
@@ -191,6 +191,34 @@ def translatePName(  # type: ignore[return]
     elif isinstance(p, URIRef):
         # type error: Incompatible return value type (got "Union[CompValue, str, None]", expected "Optional[Identifier]")
         return prologue.absolutize(p)  # type: ignore[return-value]
+
+
+def translateQuotedTriple(
+    node: typing.Any,
+) -> Optional[QuotedTriple]:
+    """
+    Turn a parsed QuotedTriple Comp into a
+    [`QuotedTriple`][rdflib.term.QuotedTriple] term.
+
+    Used as a post-visit function when traversing a parse-tree; nested
+    quoted triples are converted inside-out.
+    """
+    if isinstance(node, CompValue) and node.name == "QuotedTriple":
+        return QuotedTriple((node.subject, node.predicate, node.object))
+    return None
+
+
+def _translatePNameAndQuotedTriple(
+    node: typing.Any, prologue: Prologue
+) -> typing.Any:
+    """Post-visit function combining `translatePName` and `translateQuotedTriple`."""
+    renamed = translatePName(node, prologue)
+    if renamed is not None:
+        node = renamed
+    quoted = translateQuotedTriple(node)
+    if quoted is not None:
+        return quoted
+    return renamed
 
 
 @overload
@@ -411,6 +439,13 @@ def _traverse(
     elif isinstance(e, tuple):
         return tuple([_traverse(x, visitPre, visitPost) for x in e])
 
+    elif isinstance(e, QuotedTriple):
+        subject = _traverse(e.subject, visitPre, visitPost)
+        predicate = _traverse(e.predicate, visitPre, visitPost)
+        object_ = _traverse(e.object, visitPre, visitPost)
+        if (subject, predicate, object_) != e.triple:
+            e = QuotedTriple((subject, predicate, object_))
+
     elif isinstance(e, CompValue):
         for k, val in e.items():
             e[k] = _traverse(val, visitPre, visitPost)
@@ -433,6 +468,8 @@ def _traverseAgg(e: Any, visitor: Callable[[Any, Any], Any] = lambda n, v: None)
 
     if isinstance(e, (list, ParseResults, tuple)):
         res = [_traverseAgg(x, visitor) for x in e]
+    elif isinstance(e, QuotedTriple):
+        res = [_traverseAgg(x, visitor) for x in e.triple]
     elif isinstance(e, CompValue):
         for k, val in e.items():
             if val is not None:
@@ -891,7 +928,12 @@ def translateUpdate(
         prologue = translatePrologue(p, base, initNs, prologue)
 
         # absolutize/resolve prefixes
-        u = traverse(u, visitPost=functools.partial(translatePName, prologue=prologue))
+        u = traverse(
+            u,
+            visitPost=functools.partial(
+                _translatePNameAndQuotedTriple, prologue=prologue
+            ),
+        )
         u = _traverse(u, _simplifyFilters)
 
         u = traverse(u, visitPost=translatePath)
@@ -919,7 +961,10 @@ def translateQuery(
 
     # absolutize/resolve prefixes
     q[1] = traverse(
-        q[1], visitPost=functools.partial(translatePName, prologue=prologue)
+        q[1],
+        visitPost=functools.partial(
+            _translatePNameAndQuotedTriple, prologue=prologue
+        ),
     )
 
     P, PV = translate(q[1])

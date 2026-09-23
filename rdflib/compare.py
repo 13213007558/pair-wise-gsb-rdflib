@@ -114,7 +114,7 @@ from typing import (
 )
 
 from rdflib.graph import ConjunctiveGraph, Graph, ReadOnlyGraphAggregate, _TripleType
-from rdflib.term import BNode, IdentifiedNode, Node, URIRef
+from rdflib.term import BNode, IdentifiedNode, Node, QuotedTriple, URIRef
 
 if TYPE_CHECKING:
     from _hashlib import HASH
@@ -322,6 +322,11 @@ class _TripleCanonicalizer:
         for s, p, o in self.graph:
             nodes = set([s, p, o])
             b = set([x for x in nodes if isinstance(x, BNode)])
+            for x in nodes:
+                if isinstance(x, QuotedTriple):
+                    for nested_bnode in _quoted_bnodes(x):
+                        b.add(nested_bnode)
+                        self._neighbors[nested_bnode].add(x)
             if len(b) > 0:
                 others |= nodes - b
                 bnodes |= b
@@ -538,8 +543,35 @@ class _TripleCanonicalizer:
         for term in triple:
             if isinstance(term, BNode):
                 yield BNode(value="cb%s" % labels[term])
+            elif isinstance(term, QuotedTriple):
+                yield _canonicalize_quoted(term, labels)
             else:
                 yield term
+
+
+def _quoted_bnodes(term: Node) -> Iterator[BNode]:
+    """Yield the blank nodes nested inside a quoted triple term."""
+    if isinstance(term, QuotedTriple):
+        for component in term.triple:
+            if isinstance(component, BNode):
+                yield component
+            elif isinstance(component, QuotedTriple):
+                yield from _quoted_bnodes(component)
+
+
+def _canonicalize_quoted(
+    term: QuotedTriple, labels: dict[Node, str]
+) -> QuotedTriple:
+    """Replace blank nodes inside a quoted triple with canonical labels."""
+
+    def _canonicalize(node: Node) -> Node:
+        if isinstance(node, BNode):
+            return BNode(value="cb%s" % labels[node])
+        if isinstance(node, QuotedTriple):
+            return QuotedTriple(tuple(_canonicalize(c) for c in node.triple))
+        return node
+
+    return _canonicalize(term)  # type: ignore[return-value]
 
 
 def to_isomorphic(graph: Graph) -> IsomorphicGraph:

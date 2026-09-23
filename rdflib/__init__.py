@@ -200,7 +200,15 @@ from rdflib.namespace import (
     XSD,
     Namespace,
 )
-from rdflib.term import BNode, IdentifiedNode, Literal, Node, URIRef, Variable
+from rdflib.term import (
+    BNode,
+    IdentifiedNode,
+    Literal,
+    Node,
+    QuotedTriple,
+    URIRef,
+    Variable,
+)
 
 from rdflib import plugin, query, util  # isort:skip
 from rdflib.container import *  # isort:skip # noqa: F403

@@ -50,7 +50,7 @@ from rdflib.plugins.sparql.sparql import (
     QueryContext,
     SPARQLError,
 )
-from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
+from rdflib.term import BNode, Identifier, Literal, QuotedTriple, URIRef, Variable
 
 if TYPE_CHECKING:
     from rdflib.paths import Path
@@ -68,6 +68,58 @@ except ImportError:
 _Triple = tuple[Identifier, Identifier, Identifier]
 
 
+def _quotedTripleVars(term: Any) -> bool:
+    """Check whether a term is a quoted triple pattern containing
+    unbound variables (or blank nodes, which act as variables in
+    SPARQL graph patterns)."""
+    if not isinstance(term, QuotedTriple):
+        return False
+    for component in term.triple:
+        if isinstance(component, (Variable, BNode)):
+            return True
+        if _quotedTripleVars(component):
+            return True
+    return False
+
+
+def _resolveQuotedTriple(term: Any, ctx: QueryContext) -> Any:
+    """Substitute already-bound variables inside a quoted triple pattern."""
+    if not isinstance(term, QuotedTriple):
+        return term
+
+    def _resolve(component: Any) -> Any:
+        if isinstance(component, QuotedTriple):
+            return _resolveQuotedTriple(component, ctx)
+        resolved = ctx[component]
+        return resolved if resolved is not None else component
+
+    return QuotedTriple(tuple(_resolve(component) for component in term.triple))
+
+
+def _matchQuotedTriple(ctx: QueryContext, pattern: Any, term: Any) -> bool:
+    """
+    Match a quoted triple pattern against a term from the graph, binding
+    variables in `ctx`.
+
+    Only quoted triple terms match a quoted triple pattern: an asserted
+    triple with the same subject, predicate and object is never a match
+    for a quoted triple pattern, and vice versa.
+    """
+    if not isinstance(pattern, QuotedTriple):
+        return True
+    if not isinstance(term, QuotedTriple):
+        return False
+    for pattern_component, term_component in zip(pattern.triple, term.triple):
+        if isinstance(pattern_component, (Variable, BNode)):
+            ctx[pattern_component] = term_component  # raises AlreadyBound
+        elif isinstance(pattern_component, QuotedTriple):
+            if not _matchQuotedTriple(ctx, pattern_component, term_component):
+                return False
+        elif pattern_component != term_component:
+            return False
+    return True
+
+
 def evalBGP(
     ctx: QueryContext, bgp: list[_Triple]
 ) -> Generator[FrozenBindings, None, None]:
@@ -81,14 +133,21 @@ def evalBGP(
 
     s, p, o = bgp[0]
 
-    _s = ctx[s]
-    _p = ctx[p]
-    _o = ctx[o]
+    _s = _resolveQuotedTriple(ctx[s], ctx)
+    _p = _resolveQuotedTriple(ctx[p], ctx)
+    _o = _resolveQuotedTriple(ctx[o], ctx)
+
+    # quoted triple patterns with unbound variables cannot be looked up
+    # directly in the store; scan and match them as terms instead
+    has_quoted_pattern = any(_quotedTripleVars(t) for t in (_s, _p, _o))
+    qs = None if _quotedTripleVars(_s) else _s
+    qp = None if _quotedTripleVars(_p) else _p
+    qo = None if _quotedTripleVars(_o) else _o
 
     # type error: Item "None" of "Optional[Graph]" has no attribute "triples"
     # type Argument 1 to "triples" of "Graph" has incompatible type "tuple[Union[str, Path, None], Union[str, Path, None], Union[str, Path, None]]"; expected "tuple[Optional[Node], Optional[Node], Optional[Node]]"
-    for ss, sp, so in ctx.graph.triples((_s, _p, _o)):  # type: ignore[union-attr, arg-type]
-        if None in (_s, _p, _o):
+    for ss, sp, so in ctx.graph.triples((qs, qp, qo)):  # type: ignore[union-attr, arg-type]
+        if None in (_s, _p, _o) or has_quoted_pattern:
             c = ctx.push()
         else:
             c = ctx
@@ -96,11 +155,15 @@ def evalBGP(
         if _s is None:
             # type error: Incompatible types in assignment (expression has type "Union[Node, Any]", target has type "Identifier")
             c[s] = ss  # type: ignore[assignment]
+        elif not _matchQuotedTriple(c, _s, ss):
+            continue
 
         try:
             if _p is None:
                 # type error: Incompatible types in assignment (expression has type "Union[Node, Any]", target has type "Identifier")
                 c[p] = sp  # type: ignore[assignment]
+            elif not _matchQuotedTriple(c, _p, sp):
+                continue
         except AlreadyBound:
             continue
 
@@ -108,6 +171,8 @@ def evalBGP(
             if _o is None:
                 # type error: Incompatible types in assignment (expression has type "Union[Node, Any]", target has type "Identifier")
                 c[o] = so  # type: ignore[assignment]
+            elif not _matchQuotedTriple(c, _o, so):
+                continue
         except AlreadyBound:
             continue
 

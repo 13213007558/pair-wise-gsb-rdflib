@@ -419,8 +419,15 @@ BooleanLiteral = Keyword("true").set_parse_action(
 # [138] BlankNode ::= BLANK_NODE_LABEL | ANON
 BlankNode = BLANK_NODE_LABEL | ANON
 
+# RDF-star quoted triples (SPARQL-star). The full production is defined
+# below, once Verb is available.
+QuotedTriple = Forward()
+
 # [109] GraphTerm ::= iri | RDFLiteral | NumericLiteral | BooleanLiteral | BlankNode | NIL
-GraphTerm = iri | RDFLiteral | NumericLiteral | BooleanLiteral | BlankNode | NIL
+# RDF-star: GraphTerm is extended with quoted triples
+GraphTerm = (
+    QuotedTriple | iri | RDFLiteral | NumericLiteral | BooleanLiteral | BlankNode | NIL
+)
 
 # [106] VarOrTerm ::= Var | GraphTerm
 VarOrTerm = Var | GraphTerm
@@ -450,6 +457,19 @@ DataBlockValue = iri | RDFLiteral | NumericLiteral | BooleanLiteral | Keyword("U
 # [78] Verb ::= VarOrIri | A
 Verb = VarOrIri | A
 
+# RDF-star (SPARQL-star) quoted triple:
+# QuotedTriple ::= '<<' VarOrTerm Verb VarOrTerm '>>'
+# The subject/object may themselves be quoted triples (via GraphTerm),
+# allowing arbitrary nesting. The parsed Comp is turned into a
+# rdflib.term.QuotedTriple term during algebra translation.
+QuotedTriple <<= Comp(
+    "QuotedTriple",
+    Suppress("<<")
+    + Param("subject", VarOrTerm)
+    + Param("predicate", Verb)
+    + Param("object", VarOrTerm)
+    + Suppress(">>"),
+)
 
 # [85] VerbSimple ::= Var
 VerbSimple = Var
