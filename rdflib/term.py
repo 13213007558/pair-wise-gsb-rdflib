@@ -1766,6 +1766,165 @@ class Literal(Identifier):
         return self
 
 
+class QuotedTriple(Node):
+    """
+    A Quoted Triple (RDF-star): a triple used as a term in another triple.
+
+    A quoted triple denotes the triple itself, without asserting it in the
+    graph. It can appear in subject or object position (never as predicate),
+    and quoted triples may be nested inside other quoted triples.
+
+    >>> from rdflib import URIRef, Literal
+    >>> s = URIRef("http://example.org/s")
+    >>> p = URIRef("http://example.org/p")
+    >>> qt = QuotedTriple((s, p, Literal("o")))
+    >>> qt.n3()
+    '<< <http://example.org/s> <http://example.org/p> "o" >>'
+    >>> qt == QuotedTriple((s, p, Literal("o")))
+    True
+    >>> qt == (s, p, Literal("o"))
+    False
+    """
+
+    __slots__ = ("_subject", "_predicate", "_object")
+
+    def __init__(self, triple: tuple[Node, Node, Node]) -> None:
+        if not isinstance(triple, tuple) or len(triple) != 3:
+            raise ValueError(
+                "QuotedTriple must be instantiated with a (subject, predicate,"
+                " object) 3-tuple, got %r" % (triple,)
+            )
+        s, p, o = triple
+        if not isinstance(s, Node):
+            raise ValueError(
+                "Subject of a QuotedTriple must be an rdflib term, got %r" % (s,)
+            )
+        # The predicate position is still constrained by the RDF rules: only
+        # an IRI (or a Variable, for SPARQL-star patterns) is allowed.
+        if not isinstance(p, (URIRef, Variable)):
+            raise ValueError(
+                "Predicate of a QuotedTriple must be a URIRef or Variable, got %r"
+                % (p,)
+            )
+        if not isinstance(o, Node):
+            raise ValueError(
+                "Object of a QuotedTriple must be an rdflib term, got %r" % (o,)
+            )
+        self._subject = s
+        self._predicate = p
+        self._object = o
+
+    @property
+    def subject(self) -> Node:
+        return self._subject
+
+    @property
+    def predicate(self) -> Node:
+        return self._predicate
+
+    @property
+    def object(self) -> Node:
+        return self._object
+
+    def toTuple(self) -> tuple[Node, Node, Node]:  # noqa: N802
+        return (self._subject, self._predicate, self._object)
+
+    def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
+        """Render as an RDF-star quoted-triple term, preserving nesting,
+        literal escaping, datatypes and language tags."""
+        return "<< %s %s %s >>" % (
+            self._subject.n3(namespace_manager),
+            self._predicate.n3(namespace_manager),
+            self._object.n3(namespace_manager),
+        )
+
+    def __repr__(self) -> str:
+        if self.__class__ is QuotedTriple:
+            clsName = "rdflib.term.QuotedTriple"  # noqa: N806
+        else:
+            clsName = self.__class__.__name__  # noqa: N806
+        return "%s((%r, %r, %r))" % (
+            clsName,
+            self._subject,
+            self._predicate,
+            self._object,
+        )
+
+    def toPython(self) -> QuotedTriple:  # noqa: N802
+        return self
+
+    def eq(self, other: Any) -> bool:
+        """A semantic/interpreted equality function,
+        by default, same as __eq__"""
+        return self.__eq__(other)
+
+    def neq(self, other: Any) -> bool:
+        """A semantic/interpreted not equal function,
+        by default, same as __ne__"""
+        return self.__ne__(other)
+
+    def __eq__(self, other: Any) -> bool:
+        """Quoted triples are equal iff their three components are equal."""
+        if type(self) is type(other):
+            return (
+                self._subject == other._subject
+                and self._predicate == other._predicate
+                and self._object == other._object
+            )
+        return False
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash((QuotedTriple, self._subject, self._predicate, self._object))
+
+    def __lt__(self, other: Any) -> bool:
+        if other is None:
+            return False  # Nothing is less than None
+        elif type(self) is type(other):
+            return (self._subject, self._predicate, self._object) < (
+                other._subject,
+                other._predicate,
+                other._object,
+            )
+        elif isinstance(other, Node):
+            return _ORDERING[type(self)] < _ORDERING[type(other)]
+
+        return NotImplemented
+
+    def __gt__(self, other: Any) -> bool:
+        if other is None:
+            return True  # everything bigger than None
+        elif type(self) is type(other):
+            return (self._subject, self._predicate, self._object) > (
+                other._subject,
+                other._predicate,
+                other._object,
+            )
+        elif isinstance(other, Node):
+            return _ORDERING[type(self)] > _ORDERING[type(other)]
+
+        return NotImplemented
+
+    def __le__(self, other: Any) -> bool:
+        r = self.__lt__(other)
+        if r:
+            return True
+        return self == other
+
+    def __ge__(self, other: Any) -> bool:
+        r = self.__gt__(other)
+        if r:
+            return True
+        return self == other
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[QuotedTriple], tuple[tuple[Node, Node, Node]]]:
+        return (QuotedTriple, (self.toTuple(),))
+
+
 def _parseXML(xmlstring: str) -> xml.dom.minidom.Document:  # noqa: N802
     retval = xml.dom.minidom.parseString(
         f"<rdflibtoplevelelement>{xmlstring}</rdflibtoplevelelement>"
@@ -2367,7 +2526,7 @@ class Variable(Identifier):
 # we leave "space" for more subclasses of Node elsewhere
 # default-dict to grazefully fail for new subclasses
 _ORDERING: dict[type[Node], int] = defaultdict(int)
-_ORDERING.update({BNode: 10, Variable: 20, URIRef: 30, Literal: 40})
+_ORDERING.update({BNode: 10, Variable: 20, URIRef: 30, Literal: 40, QuotedTriple: 50})
 
 
 def _isEqualXMLNode(  # noqa: N802

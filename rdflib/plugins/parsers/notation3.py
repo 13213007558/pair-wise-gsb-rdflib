@@ -59,6 +59,7 @@ from rdflib.term import (
     Identifier,
     Literal,
     Node,
+    QuotedTriple,
     URIRef,
     Variable,
     _unique_id,
@@ -400,6 +401,7 @@ class SinkParser:
         genPrefix: str = "",
         why: Optional[Callable[[], None]] = None,
         turtle: bool = False,
+        rdfstar: bool = False,
     ):
         """note: namespace names should *not* end in  # ;
         the  # will get added during qname processing"""
@@ -427,6 +429,7 @@ class SinkParser:
         self._reason = why  # Why the parser was asked to parse this
 
         self.turtle = turtle  # raise exception when encountering N3 extensions
+        self.rdfstar = rdfstar  # allow RDF-star quoted triples (<< ... >>)
         # Turtle allows single or double quotes around strings, whereas N3
         # only allows double quotes.
         self.string_delimiters = ('"', "'") if turtle else ('"',)
@@ -919,6 +922,58 @@ class SinkParser:
         self._anonymousNodes[ln] = term
         return term
 
+    def quotedTriple(self, argstr: str, i: int, res: MutableSequence[Any]) -> int:
+        """Parse an RDF-star quoted triple: << subject predicate object >>
+
+        The quoted triple is returned as a single QuotedTriple term; it is
+        not asserted in the graph. Quoted triples may nest.
+        """
+        if not self.rdfstar:
+            self.BadSyntax(
+                argstr,
+                i,
+                "found '<<' (RDF-star quoted triple), but RDF-star support"
+                " is not enabled. Pass rdfstar=True to the parser to parse"
+                " quoted triples into QuotedTriple terms.",
+            )
+        j = self.skipSpace(argstr, i + 2)
+        if j < 0:
+            self.BadSyntax(argstr, i, "EOF found directly after '<<'")
+
+        subj: list[Any] = []
+        j = self.item(argstr, j, subj)
+        if j < 0:
+            self.BadSyntax(argstr, i, "expected subject after '<<'")
+
+        pred: list[Any] = []
+        j = self.prop(argstr, j, pred)
+        if j < 0:
+            self.BadSyntax(argstr, i, "expected predicate in quoted triple")
+
+        obj: list[Any] = []
+        j = self.object(argstr, j, obj)
+        if j < 0:
+            self.BadSyntax(argstr, i, "expected object in quoted triple")
+
+        j = self.skipSpace(argstr, j)
+        if j < 0:
+            self.BadSyntax(argstr, i, "EOF found, expected '>>'")
+        if argstr[j : j + 2] != ">>":
+            self.BadSyntax(argstr, j, "expected '>>' to close quoted triple")
+
+        try:
+            qt = QuotedTriple(
+                (
+                    self._store.normalise(self._context, subj[0]),
+                    self._store.normalise(self._context, pred[0]),
+                    self._store.normalise(self._context, obj[0]),
+                )
+            )
+        except ValueError as e:
+            self.BadSyntax(argstr, i, "bad quoted triple: %s" % e)
+        res.append(qt)
+        return j + 2
+
     def node(
         self,
         argstr: str,
@@ -937,6 +992,9 @@ class SinkParser:
             return j  # eof
         i = j
         ch = argstr[i]  # Quick 1-character checks first:
+
+        if ch == "<" and argstr[i : i + 2] == "<<":
+            return self.quotedTriple(argstr, i, res)
 
         if ch == "[":
             bnodeID = self.here(i)
@@ -1924,6 +1982,9 @@ class RDFSink:
         p = self.normalise(f, p)  # type: ignore[arg-type]
         o = self.normalise(f, o)  # type: ignore[arg-type]
 
+        if isinstance(p, QuotedTriple):
+            raise ParserError("QuotedTriple used as predicate")
+
         if f == self.rootFormula:
             # print s, p, o, '.'
             self.graph.add((s, p, o))
@@ -2031,6 +2092,7 @@ class TurtleParser(Parser):
         graph: Graph,
         encoding: Optional[str] = "utf-8",
         turtle: bool = True,
+        rdfstar: bool = False,
     ) -> None:
         if encoding not in [None, "utf-8"]:
             raise ParserError(
@@ -2040,7 +2102,7 @@ class TurtleParser(Parser):
         sink = RDFSink(graph)
 
         baseURI = graph.absolutize(source.getPublicId() or source.getSystemId() or "")
-        p = SinkParser(sink, baseURI=baseURI, turtle=turtle)
+        p = SinkParser(sink, baseURI=baseURI, turtle=turtle, rdfstar=rdfstar)
         # N3 parser prefers str stream
         stream: Reader[str] | Reader[bytes] | None = cast(
             "Reader[str]", source.getCharacterStream()
@@ -2067,6 +2129,7 @@ class N3Parser(TurtleParser):
     # type error: Signature of "parse" incompatible with supertype "TurtleParser"
     def parse(  # type: ignore[override]
         self, source: InputSource, graph: Graph, encoding: Optional[str] = "utf-8"
+        rdfstar: bool = False,
     ) -> None:
         # we're currently being handed a Graph, not a ConjunctiveGraph
         # context-aware is this implied by formula_aware
@@ -2083,4 +2146,6 @@ class N3Parser(TurtleParser):
         # TODO: update N3Processor so that it can use conj_graph as the sink
         conj_graph.namespace_manager = graph.namespace_manager
 
-        TurtleParser.parse(self, source, conj_graph, encoding, turtle=False)
+        TurtleParser.parse(
+            self, source, conj_graph, encoding, turtle=False, rdfstar=rdfstar
+        )

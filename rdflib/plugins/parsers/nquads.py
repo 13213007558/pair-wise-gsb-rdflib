@@ -54,6 +54,7 @@ class NQuadsParser(W3CNTriplesParser):
         sink: Graph,
         bnode_context: Optional[_BNodeContextType] = None,
         skolemize: bool = False,
+        rdfstar: bool = False,
         **kwargs: Any,
     ):
         """Parse inputsource as an N-Quads file.
@@ -94,6 +95,7 @@ class NQuadsParser(W3CNTriplesParser):
         # type error: Incompatible types in assignment (expression has type "ConjunctiveGraph", base class "W3CNTriplesParser" defined the type as "Union[DummySink, NTGraphSink]")
         self.sink: Dataset = ds  # type: ignore[assignment]
         self.skolemize = skolemize
+        self.rdfstar = rdfstar
 
         source: IO[str] | None = cast(IO[str], inputsource.getCharacterStream())
         if not source:

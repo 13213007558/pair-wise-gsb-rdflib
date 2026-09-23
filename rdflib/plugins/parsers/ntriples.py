@@ -24,7 +24,7 @@ from rdflib.compat import _string_escape_map, decodeUnicodeEscape
 from rdflib.exceptions import ParserError as ParseError
 from rdflib.parser import InputSource, Parser
 from rdflib.term import BNode as bNode
-from rdflib.term import Literal, URIRef
+from rdflib.term import Literal, QuotedTriple, URIRef
 from rdflib.term import URIRef as URI  # noqa: N814
 
 if TYPE_CHECKING:
@@ -140,7 +140,15 @@ class W3CNTriplesParser:
     `W3CNTriplesParser`.
     """
 
-    __slots__ = ("_bnode_ids", "sink", "buffer", "file", "line", "skolemize")
+    __slots__ = (
+        "_bnode_ids",
+        "sink",
+        "buffer",
+        "file",
+        "line",
+        "skolemize",
+        "rdfstar",
+    )
 
     def __init__(
         self,
@@ -148,6 +156,7 @@ class W3CNTriplesParser:
         bnode_context: Optional[_BNodeContextType] = None,
     ):
         self.skolemize = False
+        self.rdfstar = False
 
         if bnode_context is not None:
             self._bnode_ids = bnode_context
@@ -169,6 +178,7 @@ class W3CNTriplesParser:
         f: Union[TextIO, IO[bytes], codecs.StreamReader],
         bnode_context: Optional[_BNodeContextType] = None,
         skolemize: bool = False,
+        rdfstar: bool = False,
     ) -> Union[DummySink, NTGraphSink]:
         """Parse f as an N-Triples file.
 
@@ -179,6 +189,9 @@ class W3CNTriplesParser:
                 passed in to define a distinct context for a given call to
                 `parse`.
             skolemize: Whether to skolemize blank nodes
+            rdfstar: Whether to parse RDF-star quoted triples (<< ... >>) into
+                QuotedTriple terms. If False, encountering a quoted triple
+                raises a ParseError.
 
         Returns:
             The sink containing the parsed triples
@@ -192,6 +205,7 @@ class W3CNTriplesParser:
             f = codecs.getreader("utf-8")(f)
 
         self.skolemize = skolemize
+        self.rdfstar = rdfstar
         self.file = f  # type: ignore[assignment]
         self.buffer = ""
         while True:
@@ -273,9 +287,13 @@ class W3CNTriplesParser:
 
     def subject(self, bnode_context=None) -> Union[bNode, URIRef]:
         # @@ Consider using dictionary cases
-        subj = self.uriref() or self.nodeid(bnode_context)
+        subj = (
+            self.quotedtriple(bnode_context)
+            or self.uriref()
+            or self.nodeid(bnode_context)
+        )
         if not subj:
-            raise ParseError("Subject must be uriref or nodeID")
+            raise ParseError("Subject must be uriref, nodeID or quoted triple")
         return subj
 
     def predicate(self) -> Union[bNode, URIRef]:
@@ -287,10 +305,41 @@ class W3CNTriplesParser:
     def object(
         self, bnode_context: Optional[_BNodeContextType] = None
     ) -> Union[URI, bNode, Literal]:
-        objt = self.uriref() or self.nodeid(bnode_context) or self.literal()
+        objt = (
+            self.quotedtriple(bnode_context)
+            or self.uriref()
+            or self.nodeid(bnode_context)
+            or self.literal()
+        )
         if objt is False:
             raise ParseError("Unrecognised object type")
         return objt
+
+    def quotedtriple(
+        self, bnode_context: Optional[_BNodeContextType] = None
+    ) -> Union[te.Literal[False], QuotedTriple]:
+        if self.peek("<<"):
+            if not self.rdfstar:
+                raise ParseError(
+                    "Found RDF-star quoted triple '<< ... >>', but RDF-star"
+                    " support is not enabled. Pass rdfstar=True to the parser"
+                    " to parse quoted triples into QuotedTriple terms."
+                )
+            self.line = self.line[2:]  # type: ignore[index]
+            self.eat(r_wspace)
+            subj = self.subject(bnode_context)
+            self.eat(r_wspaces)
+            pred = self.predicate()
+            self.eat(r_wspaces)
+            objt = self.object(bnode_context)
+            self.eat(r_wspace)
+            if not self.peek(">>"):
+                raise ParseError(
+                    "Expected '>>' to close quoted triple at: %s" % self.line
+                )
+            self.line = self.line[2:]  # type: ignore[index]
+            return QuotedTriple((subj, pred, objt))
+        return False
 
     def uriref(self) -> Union[te.Literal[False], URI]:
         if self.peek("<"):
