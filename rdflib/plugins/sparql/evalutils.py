@@ -44,6 +44,39 @@ def _minus(
             yield x
 
 
+class _LazyCache(Iterable[_FrozenDictT]):
+    """
+    A re-iterable, lazily populated cache around an iterable of
+    solutions.
+
+    Items are pulled from the underlying iterable only as far as
+    consumers demand: truncating iteration (e.g. through LIMIT) never
+    forces evaluation of the remaining items, while repeated
+    iterations share the items pulled so far.
+
+    Unlike materializing the iterable into a set, this preserves
+    duplicate solutions (multiset semantics) and does not evaluate
+    anything up front.
+    """
+
+    def __init__(self, iterable: Iterable[_FrozenDictT]):
+        self._it = iter(iterable)
+        self._cache: list[_FrozenDictT] = []
+        self._exhausted = False
+
+    def __iter__(self) -> Generator[_FrozenDictT, None, None]:
+        idx = 0
+        while idx < len(self._cache):
+            yield self._cache[idx]
+            idx += 1
+        if self._exhausted:
+            return
+        for item in self._it:
+            self._cache.append(item)
+            yield item
+        self._exhausted = True
+
+
 @overload
 def _join(
     a: Iterable[FrozenBindings], b: Iterable[Mapping[Identifier, Identifier]]

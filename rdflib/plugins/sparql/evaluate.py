@@ -34,6 +34,7 @@ from rdflib.graph import Graph
 from rdflib.plugins.sparql import CUSTOM_EVALS, parser
 from rdflib.plugins.sparql.aggregates import Aggregator
 from rdflib.plugins.sparql.evalutils import (
+    _LazyCache,
     _ebv,
     _eval,
     _fillTemplate,
@@ -169,9 +170,49 @@ def evalUnion(ctx: QueryContext, union: CompValue) -> list[Any]:
 
 
 def evalMinus(ctx: QueryContext, minus: CompValue) -> Generator[FrozenDict, None, None]:
+    # https://www.w3.org/TR/sparql11-query/#neg-minus
+    # A solution of p1 is only removed if there is a solution of p2
+    # that shares at least one variable with it (non-disjoint domains)
+    # and binds all shared variables to the same values (compatible).
+    # The right-hand side is wrapped in a lazily populated, re-iterable
+    # cache instead of a set: duplicates are preserved, and the
+    # right-hand pattern is only evaluated as far as the left-hand
+    # solutions actually demand (e.g. when iteration is cut off by
+    # LIMIT, the remaining right-hand solutions are never computed).
     a = evalPart(ctx, minus.p1)
-    b = set(evalPart(ctx, minus.p2))
+    b = _LazyCache(evalPart(ctx, minus.p2))
     return _minus(a, b)
+
+
+def evalExists(ctx: QueryContext, graph: CompValue) -> bool:
+    """
+    https://www.w3.org/TR/sparql11-query/#func-filter-exists
+
+    Return True if the given graph pattern has at least one solution
+    in the given context.
+
+    The caller thaws the current outer solution into the context, so
+    the pattern is re-evaluated for every outer solution with the
+    outer bindings substituted in; variables that are not bound in the
+    outer solution remain unbound (they are not treated as bound to
+    some empty value).
+
+    Evaluation stops at the first solution found.
+    """
+    for _ in evalPart(ctx, graph):
+        return True
+    return False
+
+
+def evalNotExists(ctx: QueryContext, graph: CompValue) -> bool:
+    """
+    https://www.w3.org/TR/sparql11-query/#func-filter-exists
+
+    Return True if the given graph pattern has no solution in the
+    given context. This is the negation of evalExists, evaluated with
+    the same per-solution substitution of outer bindings.
+    """
+    return not evalExists(ctx, graph)
 
 
 def evalLeftJoin(
