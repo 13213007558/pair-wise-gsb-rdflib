@@ -34,6 +34,7 @@ import rdflib.term
 if TYPE_CHECKING:
     from rdflib.graph import Graph, _TripleType
     from rdflib.plugins.sparql.sparql import Query, Update
+    from rdflib.plugins.sparql.update import UpdateReport
     from rdflib.term import Identifier, Variable
 
 
@@ -81,6 +82,16 @@ class UpdateProcessor:
         initNs: Mapping[str, Any] = {},  # noqa: N803
     ) -> None:
         pass
+
+    def update_with_changes(
+        self,
+        strOrQuery: Union[str, Update],  # noqa: N803
+        initBindings: Mapping[str, Identifier] = {},  # noqa: N803
+        initNs: Mapping[str, Any] = {},  # noqa: N803
+    ) -> "UpdateReport":
+        raise NotImplementedError(
+            "This update processor cannot report the changes of an update."
+        )
 
 
 class ResultException(Exception):  # noqa: N818

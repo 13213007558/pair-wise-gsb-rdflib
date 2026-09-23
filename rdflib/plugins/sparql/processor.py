@@ -14,7 +14,11 @@ from rdflib.plugins.sparql.algebra import translateQuery, translateUpdate
 from rdflib.plugins.sparql.evaluate import evalQuery
 from rdflib.plugins.sparql.parser import parseQuery, parseUpdate
 from rdflib.plugins.sparql.sparql import Query, Update
-from rdflib.plugins.sparql.update import evalUpdate
+from rdflib.plugins.sparql.update import (
+    UpdateReport,
+    evalUpdate,
+    evalUpdateWithChanges,
+)
 from rdflib.query import Processor, Result, UpdateProcessor
 from rdflib.term import Identifier
 
@@ -104,6 +108,27 @@ class SPARQLUpdateProcessor(UpdateProcessor):
             strOrQuery = translateUpdate(parseUpdate(strOrQuery), initNs=initNs)
 
         return evalUpdate(self.graph, strOrQuery, initBindings)
+
+    def update_with_changes(
+        self,
+        strOrQuery: Union[str, Update],
+        initBindings: Optional[Mapping[str, Identifier]] = None,
+        initNs: Optional[Mapping[str, Any]] = None,
+    ) -> UpdateReport:
+        """
+        Process a SPARQL Update Request and return a report of the effective
+        changes (inserted and deleted quads) of each update operation, as
+        well as the net change of the whole request.
+
+        Raises :class:`rdflib.exceptions.UnsupportedUpdateError` before
+        executing anything if the request contains operations whose changes
+        cannot be reported (e.g. ``LOAD``).
+        """
+
+        if isinstance(strOrQuery, str):
+            strOrQuery = translateUpdate(parseUpdate(strOrQuery), initNs=initNs)
+
+        return evalUpdateWithChanges(self.graph, strOrQuery, initBindings)
 
 
 class SPARQLProcessor(Processor):

@@ -319,6 +319,7 @@ if TYPE_CHECKING:
 
     import rdflib.query
     from rdflib.plugins.sparql.sparql import Query, Update
+    from rdflib.plugins.sparql.update import UpdateReport
 
 _SubjectType = Node
 _PredicateType = Node
@@ -1790,6 +1791,77 @@ class Graph(Node):
             processor = plugin.get(processor, query.UpdateProcessor)(self)
 
         return processor.update(update_object, initBindings, initNs, **kwargs)
+
+    def update_with_changes(
+        self,
+        update_object: Union[Update, str],
+        processor: Union[str, rdflib.query.UpdateProcessor] = "sparql",
+        initNs: Optional[Mapping[str, Any]] = None,  # noqa: N803
+        initBindings: Optional[Mapping[str, Identifier]] = None,  # noqa: N803
+        use_store_provided: bool = True,
+        **kwargs: Any,
+    ) -> "UpdateReport":
+        """Update this graph with the given update query and report the changes.
+
+        Works like :meth:`update`, but returns an
+        :class:`rdflib.plugins.sparql.update.UpdateReport` with the effective
+        changes (inserted and deleted quads, including the graph they belong
+        to) of each update operation of the request, as well as the net
+        change of the whole request.
+
+        Raises :class:`rdflib.exceptions.UnsupportedUpdateError` before
+        anything is executed if the request contains a ``LOAD`` operation,
+        or if the store applies updates itself in a way that cannot be
+        observed.
+
+        !!! warning "Caution"
+            This method can access indirectly requested network endpoints, for
+            example, query processing will attempt to access network endpoints
+            specified in `SERVICE` directives.
+
+            When processing untrusted or potentially malicious queries, measures
+            should be taken to restrict network and file access.
+
+            For information on available security measures, see the RDFLib
+            Security Considerations documentation.
+        """
+        initBindings = initBindings or {}  # noqa: N806
+        initNs = initNs or dict(self.namespaces())  # noqa: N806
+
+        if use_store_provided:
+            try:
+                # Probe with an empty update request, which applies no
+                # operations. Stores that only forward to Store.update raise
+                # NotImplementedError; stores that really apply updates
+                # themselves do not, and their writes cannot be observed.
+                self.store.update("", {}, {}, None)
+            except NotImplementedError:
+                pass  # store has no own update implementation
+            except Exception as error:
+                raise exceptions.UnsupportedUpdateError(
+                    (
+                        "Cannot report the changes of an update applied by "
+                        "store %s: the store applies updates itself in a way "
+                        "that cannot be observed."
+                    )
+                    % type(self.store).__name__
+                ) from error
+            else:
+                raise exceptions.UnsupportedUpdateError(
+                    (
+                        "Cannot report the changes of an update applied by "
+                        "store %s: the store applies updates itself in a way "
+                        "that cannot be observed."
+                    )
+                    % type(self.store).__name__
+                )
+
+        if not isinstance(processor, query.UpdateProcessor):
+            processor = plugin.get(processor, query.UpdateProcessor)(self)
+
+        return processor.update_with_changes(
+            update_object, initBindings, initNs, **kwargs
+        )
 
     def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
         """Return an n3 identifier for the Graph"""

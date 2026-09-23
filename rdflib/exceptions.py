@@ -8,6 +8,7 @@ __all__ = [
     "Error",
     "ParserError",
     "UniquenessError",
+    "UnsupportedUpdateError",
 ]
 
 
@@ -43,3 +44,17 @@ class UniquenessError(Error):
 Uniqueness assumption is not fulfilled. Multiple values are: %s"
             % values,
         )
+
+
+class UnsupportedUpdateError(Error):
+    """An update request (or store) is not supported in this context.
+
+    Raised, before anything is executed, when a change report is requested
+    for an update that contains operations whose writes cannot be observed
+    (e.g. ``LOAD``) or when the underlying store applies updates itself in
+    a way that cannot be observed.
+    """
+
+    def __init__(self, msg: Optional[str] = None):
+        Error.__init__(self, msg)
+        self.msg = msg

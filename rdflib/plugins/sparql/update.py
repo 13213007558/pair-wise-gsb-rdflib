@@ -5,14 +5,97 @@ Code for carrying out Update Operations
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
-from rdflib.graph import Graph
+from rdflib.exceptions import UnsupportedUpdateError
+from rdflib.graph import ConjunctiveGraph, Dataset, Graph
 from rdflib.plugins.sparql.evaluate import evalBGP, evalPart
 from rdflib.plugins.sparql.evalutils import _fillTemplate, _join
 from rdflib.plugins.sparql.parserutils import CompValue
 from rdflib.plugins.sparql.sparql import FrozenDict, QueryContext, Update
 from rdflib.term import Identifier, URIRef, Variable
+
+
+class Quad(NamedTuple):
+    """A quad that was effectively inserted or deleted by an update operation.
+
+    ``graph`` is the identifier of the graph the triple belongs to, i.e. the
+    identifier of the default graph for triples outside named graphs.
+    """
+
+    subject: Identifier
+    predicate: Identifier
+    object: Identifier
+    graph: Optional[Identifier]
+
+
+@dataclass
+class UpdateOperationChanges:
+    """The effective changes applied by a single update operation of a request.
+
+    Only effective changes are reported: inserting a quad that is already
+    present is not an insertion and deleting a quad that is not present is
+    not a deletion.
+    """
+
+    name: str
+    inserted: set[Quad] = field(default_factory=set)
+    deleted: set[Quad] = field(default_factory=set)
+
+
+@dataclass
+class UpdateReport:
+    """The changes applied by a SPARQL update request.
+
+    ``operations`` holds the effective changes of each update operation of
+    the request, in execution order. ``inserted`` and ``deleted`` give the
+    net change of the whole request.
+    """
+
+    operations: list[UpdateOperationChanges] = field(default_factory=list)
+
+    def _net(self) -> tuple[set[Quad], set[Quad]]:
+        inserted: set[Quad] = set()
+        deleted: set[Quad] = set()
+        for operation in self.operations:
+            for quad in operation.inserted:
+                if quad in deleted:
+                    deleted.discard(quad)
+                else:
+                    inserted.add(quad)
+            for quad in operation.deleted:
+                if quad in inserted:
+                    inserted.discard(quad)
+                else:
+                    deleted.add(quad)
+        return inserted, deleted
+
+    @property
+    def inserted(self) -> set[Quad]:
+        """Quads that were absent before and are present after the request."""
+        return self._net()[0]
+
+    @property
+    def deleted(self) -> set[Quad]:
+        """Quads that were present before and are absent after the request."""
+        return self._net()[1]
+
+
+def _snapshotQuads(graph: Graph) -> set[Quad]:
+    """The current state of ``graph`` as a set of quads."""
+    if isinstance(graph, (Dataset, ConjunctiveGraph)):
+        quads: set[Quad] = set()
+        for s, p, o, ctx in graph.quads():
+            if isinstance(ctx, Graph):
+                quads.add(Quad(s, p, o, ctx.identifier))
+            elif ctx is None:
+                # Dataset.quads() reports the default graph as None
+                quads.add(Quad(s, p, o, graph.default_graph.identifier))
+            else:
+                quads.add(Quad(s, p, o, ctx))
+        return quads
+    return {Quad(s, p, o, graph.identifier) for s, p, o in graph}
 
 
 def _graphOrDefault(ctx: QueryContext, g: str) -> Optional[Graph]:
@@ -324,30 +407,85 @@ def evalUpdate(
         ctx.prologue = u.prologue
 
         try:
-            if u.name == "Load":
-                evalLoad(ctx, u)
-            elif u.name == "Clear":
-                evalClear(ctx, u)
-            elif u.name == "Drop":
-                evalDrop(ctx, u)
-            elif u.name == "Create":
-                evalCreate(ctx, u)
-            elif u.name == "Add":
-                evalAdd(ctx, u)
-            elif u.name == "Move":
-                evalMove(ctx, u)
-            elif u.name == "Copy":
-                evalCopy(ctx, u)
-            elif u.name == "InsertData":
-                evalInsertData(ctx, u)
-            elif u.name == "DeleteData":
-                evalDeleteData(ctx, u)
-            elif u.name == "DeleteWhere":
-                evalDeleteWhere(ctx, u)
-            elif u.name == "Modify":
-                evalModify(ctx, u)
-            else:
-                raise Exception("Unknown update operation: %s" % (u,))
+            _evalUpdateOperation(ctx, u)
         except:  # noqa: E722
             if not u.silent:
                 raise
+
+
+def _evalUpdateOperation(ctx: QueryContext, u: CompValue) -> None:
+    if u.name == "Load":
+        evalLoad(ctx, u)
+    elif u.name == "Clear":
+        evalClear(ctx, u)
+    elif u.name == "Drop":
+        evalDrop(ctx, u)
+    elif u.name == "Create":
+        evalCreate(ctx, u)
+    elif u.name == "Add":
+        evalAdd(ctx, u)
+    elif u.name == "Move":
+        evalMove(ctx, u)
+    elif u.name == "Copy":
+        evalCopy(ctx, u)
+    elif u.name == "InsertData":
+        evalInsertData(ctx, u)
+    elif u.name == "DeleteData":
+        evalDeleteData(ctx, u)
+    elif u.name == "DeleteWhere":
+        evalDeleteWhere(ctx, u)
+    elif u.name == "Modify":
+        evalModify(ctx, u)
+    else:
+        raise Exception("Unknown update operation: %s" % (u,))
+
+
+def evalUpdateWithChanges(
+    graph: Graph,
+    update: Update,
+    initBindings: Optional[Mapping[str, Identifier]] = None,
+) -> UpdateReport:
+    """Like :func:`evalUpdate`, but returns a :class:`UpdateReport` describing
+    the effective changes of each update operation of the request, as well as
+    the net change of the whole request.
+
+    The report is derived from the state of the graph before and after each
+    operation, so it reflects the quads actually written to the graph
+    (including blank nodes instantiated from ``INSERT`` templates) and the
+    ``WHERE`` clause is never evaluated more than once.
+
+    ``LOAD`` operations are not supported, as their writes cannot be
+    observed; :class:`rdflib.exceptions.UnsupportedUpdateError` is raised
+    before anything is executed.
+    """
+
+    for u in update.algebra:
+        if u.name == "Load":
+            raise UnsupportedUpdateError(
+                "Cannot report changes for LOAD operations: the data a LOAD"
+                " operation writes cannot be observed."
+            )
+
+    report = UpdateReport()
+
+    for u in update.algebra:
+        initBindings = dict((Variable(k), v) for k, v in (initBindings or {}).items())
+
+        ctx = QueryContext(graph, initBindings=initBindings)
+        ctx.prologue = u.prologue
+
+        before = _snapshotQuads(graph)
+        try:
+            _evalUpdateOperation(ctx, u)
+        except:  # noqa: E722
+            if not u.silent:
+                raise
+        after = _snapshotQuads(graph)
+
+        report.operations.append(
+            UpdateOperationChanges(
+                name=u.name, inserted=after - before, deleted=before - after
+            )
+        )
+
+    return report
