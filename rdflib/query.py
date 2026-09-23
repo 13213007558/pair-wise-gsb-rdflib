@@ -34,6 +34,7 @@ import rdflib.term
 if TYPE_CHECKING:
     from rdflib.graph import Graph, _TripleType
     from rdflib.plugins.sparql.sparql import Query, Update
+    from rdflib.plugins.sparql.stats import QueryStats
     from rdflib.term import Identifier, Variable
 
 
@@ -217,6 +218,27 @@ class Result:
         self._genbindings: Optional[Iterator[Mapping[Variable, Identifier]]] = None
         self.askAnswer: Optional[bool] = None
         self.graph: Optional[Graph] = None
+        #: execution statistics of this result's query evaluation, if the
+        #: query was run with statistics enabled; see
+        #: [rdflib.plugins.sparql.stats][]
+        self.stats: Optional[QueryStats] = None
+
+    def close(self) -> None:
+        """
+        Close this result, releasing any not-yet-consumed lazy result
+        iterator.
+
+        Rows consumed so far remain available. If execution statistics
+        were enabled for the query, the final statistics remain readable
+        from the stats attribute after closing; operators whose
+        evaluation was cut short by the close are reported with state
+        "closed".
+        """
+        if self._genbindings is not None:
+            close = getattr(self._genbindings, "close", None)
+            if close is not None:
+                close()
+            self._genbindings = None
 
     @property
     def bindings(self) -> MutableSequence[Mapping[Variable, Identifier]]:

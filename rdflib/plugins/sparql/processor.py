@@ -73,6 +73,8 @@ class SPARQLResult(Result):
         self.bindings = res.get("bindings")  # type: ignore[assignment]
         self.askAnswer = res.get("askAnswer")
         self.graph = res.get("graph")
+        # execution statistics, present if the query was run with stats=True
+        self.stats = res.get("stats_")
 
 
 class SPARQLUpdateProcessor(UpdateProcessor):
@@ -121,11 +123,17 @@ class SPARQLProcessor(Processor):
         initNs: Optional[Mapping[str, Any]] = None,
         base: Optional[str] = None,
         DEBUG: bool = False,
+        stats: bool = False,
     ) -> Mapping[str, Any]:
         """
         Evaluate a query with the given initial bindings, and initial
         namespaces. The given base is used to resolve relative URIs in
         the query and will be overridden by any BASE given in the query.
+
+        If stats is True, execution statistics are collected while the
+        query result is iterated and are available from the stats
+        attribute of the returned result. See
+        [rdflib.plugins.sparql.stats][] for details.
 
         !!! warning "Caution"
 
@@ -144,4 +152,4 @@ class SPARQLProcessor(Processor):
         if isinstance(strOrQuery, str):
             strOrQuery = translateQuery(parseQuery(strOrQuery), base, initNs)
 
-        return evalQuery(self.graph, strOrQuery, initBindings, base)
+        return evalQuery(self.graph, strOrQuery, initBindings, base, stats=stats)

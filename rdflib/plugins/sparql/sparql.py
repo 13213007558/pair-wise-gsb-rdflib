@@ -21,6 +21,7 @@ from rdflib.term import BNode, Identifier, Literal, Node, URIRef, Variable
 
 if TYPE_CHECKING:
     from rdflib.paths import Path
+    from rdflib.plugins.sparql.stats import QueryStats
 
 
 _AnyT = TypeVar("_AnyT")
@@ -287,6 +288,11 @@ class QueryContext:
         self.prologue: Optional[Prologue] = None
         self._now: Optional[datetime.datetime] = None
 
+        #: execution statistics for this query evaluation, if enabled
+        #: (see rdflib.plugins.sparql.stats); None means no statistics
+        #: are collected
+        self.stats: Optional[QueryStats] = None
+
         self.bnodes: t.MutableMapping[Identifier, BNode] = collections.defaultdict(
             BNode
         )
@@ -308,6 +314,7 @@ class QueryContext:
         r.prologue = self.prologue
         r.graph = self.graph
         r.bnodes = self.bnodes
+        r.stats = self.stats
         return r
 
     @property

@@ -50,6 +50,7 @@ from rdflib.plugins.sparql.sparql import (
     QueryContext,
     SPARQLError,
 )
+from rdflib.plugins.sparql.stats import OperatorStats, QueryStats
 from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
 
 if TYPE_CHECKING:
@@ -69,10 +70,13 @@ _Triple = tuple[Identifier, Identifier, Identifier]
 
 
 def evalBGP(
-    ctx: QueryContext, bgp: list[_Triple]
+    ctx: QueryContext, bgp: list[_Triple], _stats: Optional[OperatorStats] = None
 ) -> Generator[FrozenBindings, None, None]:
     """
     A basic graph pattern
+
+    _stats, if given, is the OperatorStats node of this BGP and is used to
+    count the triples actually read from the store.
     """
 
     if not bgp:
@@ -88,6 +92,8 @@ def evalBGP(
     # type error: Item "None" of "Optional[Graph]" has no attribute "triples"
     # type Argument 1 to "triples" of "Graph" has incompatible type "tuple[Union[str, Path, None], Union[str, Path, None], Union[str, Path, None]]"; expected "tuple[Optional[Node], Optional[Node], Optional[Node]]"
     for ss, sp, so in ctx.graph.triples((_s, _p, _o)):  # type: ignore[union-attr, arg-type]
+        if _stats is not None:
+            _stats.source_rows += 1
         if None in (_s, _p, _o):
             c = ctx.push()
         else:
@@ -111,7 +117,7 @@ def evalBGP(
         except AlreadyBound:
             continue
 
-        for x in evalBGP(c, bgp[1:]):
+        for x in evalBGP(c, bgp[1:], _stats=_stats):
             yield x
 
 
@@ -269,10 +275,37 @@ def evalMultiset(ctx: QueryContext, part: CompValue):
 
 
 def evalPart(ctx: QueryContext, part: CompValue) -> Any:
+    stats = getattr(ctx, "stats", None)
+    if stats is None:
+        return _evalPart(ctx, part, None)
+
+    # statistics are enabled for this query execution: count this call and
+    # wrap the returned (lazy) row stream so rows are counted as they are
+    # actually delivered - the query is never re-executed or materialized
+    # for the sake of statistics
+    node = stats.node_for(part)
+    node.calls += 1
+    try:
+        ret = _evalPart(ctx, part, node)
+    except BaseException:
+        node._failed()
+        raise
+    return stats.wrap(node, ret)
+
+
+def _evalPart(
+    ctx: QueryContext, part: CompValue, node: Optional[OperatorStats] = None
+) -> Any:
     # try custom evaluation functions
     for name, c in CUSTOM_EVALS.items():
         try:
-            return c(ctx, part)
+            ret = c(ctx, part)
+            if node is not None:
+                # a custom evaluator handled this part; its internals
+                # cannot be observed, only its output rows are counted
+                node.opaque = True
+                node.handler = name
+            return ret
         except NotImplementedError:
             pass  # the given custome-function did not handle this part
 
@@ -283,7 +316,7 @@ def evalPart(ctx: QueryContext, part: CompValue) -> Any:
             part.triples, key=lambda t: len([n for n in t if ctx[n] is None])
         )
 
-        return evalBGP(ctx, triples)
+        return evalBGP(ctx, triples, _stats=node)
     elif part.name == "Filter":
         return evalFilter(ctx, part)
     elif part.name == "Join":
@@ -649,8 +682,15 @@ def evalQuery(
     query: Query,
     initBindings: Optional[Mapping[str, Identifier]] = None,
     base: Optional[str] = None,
+    stats: bool = False,
 ) -> Mapping[Any, Any]:
     """Evaluate a SPARQL query against a graph.
+
+    If stats is True, execution statistics are collected while the query
+    result is iterated and made available as a
+    [QueryStats][rdflib.plugins.sparql.stats.QueryStats] object in the
+    stats_ entry of the returned mapping (and the stats attribute of the
+    resulting SPARQLResult).
 
     !!! warning "Caution"
 
@@ -675,4 +715,12 @@ def evalQuery(
 
     ctx.prologue = query.prologue
 
-    return evalPart(ctx, main)
+    if stats:
+        ctx.stats = QueryStats(main)
+
+    res = evalPart(ctx, main)
+
+    if ctx.stats is not None and isinstance(res, dict):
+        res["stats_"] = ctx.stats
+
+    return res
