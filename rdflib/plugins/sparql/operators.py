@@ -579,17 +579,22 @@ def Builtin_BOUND(e: Expr, ctx) -> Literal:
 
 
 def Builtin_EXISTS(e: Expr, ctx: FrozenBindings) -> Literal:
-    # damn...
-    from rdflib.plugins.sparql.evaluate import evalPart
+    from rdflib.plugins.sparql.evaluate import evalExists, evalNotExists
 
     exists = e.name == "Builtin_EXISTS"
 
+    # Evaluate the pattern against a context seeded with the bindings of
+    # the current outer solution.  Only variables that are actually
+    # bound outside are substituted; unbound outer variables stay
+    # unbound inside the pattern.
     # type error: Incompatible types in assignment (expression has type "QueryContext", variable has type "FrozenBindings")
     ctx = ctx.ctx.thaw(ctx)  # type: ignore[assignment] # hmm
-    # type error: Argument 1 to "evalPart" has incompatible type "FrozenBindings"; expected "QueryContext"
-    for x in evalPart(ctx, e.graph):  # type: ignore[arg-type]
-        return Literal(exists)
-    return Literal(not exists)
+    if exists:
+        # type error: Argument 1 to "evalExists" has incompatible type "FrozenBindings"; expected "QueryContext"
+        return Literal(evalExists(ctx, e.graph))  # type: ignore[arg-type]
+    else:
+        # type error: Argument 1 to "evalNotExists" has incompatible type "FrozenBindings"; expected "QueryContext"
+        return Literal(evalNotExists(ctx, e.graph))  # type: ignore[arg-type]
 
 
 _CustomFunction = Callable[[Expr, FrozenBindings], Node]

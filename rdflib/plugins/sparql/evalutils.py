@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import collections
-from collections.abc import Generator, Iterable, Mapping
+from collections.abc import Container, Generator, Iterable, Mapping
 from typing import (
     Any,
     TypeVar,
@@ -42,6 +42,31 @@ def _minus(
     for x in a:
         if all((not x.compatible(y)) or x.disjointDomain(y) for y in b):
             yield x
+
+
+def _minusCompatible(
+    a: Mapping[Identifier, Identifier],
+    b: Mapping[Identifier, Identifier],
+    shared: Union[Container[Variable], None] = None,
+) -> bool:
+    """
+    The single compatibility judgement used by MINUS (and anything else
+    that needs to decide whether two solution mappings "meet").
+
+    Two solutions are compatible for MINUS when they agree on every
+    variable they have in common and their domains actually overlap,
+    i.e. the condition under which MINUS removes a solution:
+    https://www.w3.org/TR/sparql11-query/#defn_algMinus
+
+    When 'shared' (the variables shared by the two graph patterns) is
+    given, only those variables take part in the judgement, so bindings
+    that leaked into the evaluation context from enclosing scopes do not
+    count.  Unbound variables never count as bound.
+    """
+    if shared is not None:
+        a = FrozenDict((k, v) for k, v in a.items() if k in shared)
+        b = FrozenDict((k, v) for k, v in b.items() if k in shared)
+    return a.compatible(b) and not a.disjointDomain(b)
 
 
 @overload

@@ -38,7 +38,7 @@ from rdflib.plugins.sparql.evalutils import (
     _eval,
     _fillTemplate,
     _join,
-    _minus,
+    _minusCompatible,
     _val,
 )
 from rdflib.plugins.sparql.parserutils import CompValue, value
@@ -168,10 +168,70 @@ def evalUnion(ctx: QueryContext, union: CompValue) -> list[Any]:
     return branch1_branch2
 
 
+def evalExists(ctx: QueryContext, graph: CompValue) -> bool:
+    """
+    Evaluate an EXISTS graph pattern for one outer solution.
+
+    https://www.w3.org/TR/sparql11-query/#func-filter-exists
+
+    The pattern is evaluated afresh in a context seeded with the
+    bindings of the current outer solution, so variables that are bound
+    outside are visible (correlated) inside the pattern, while variables
+    that are not bound outside remain unbound - they are never treated
+    as bound to some empty value.
+    """
+    for _ in evalPart(ctx, graph):
+        return True
+    return False
+
+
+def evalNotExists(ctx: QueryContext, graph: CompValue) -> bool:
+    """
+    Evaluate a NOT EXISTS graph pattern for one outer solution.
+
+    Like evalExists, the pattern is re-evaluated for every outer
+    solution; the result is simply negated.
+    """
+    return not evalExists(ctx, graph)
+
+
 def evalMinus(ctx: QueryContext, minus: CompValue) -> Generator[FrozenDict, None, None]:
-    a = evalPart(ctx, minus.p1)
-    b = set(evalPart(ctx, minus.p2))
-    return _minus(a, b)
+    """
+    https://www.w3.org/TR/sparql11-query/#defn_algMinus
+
+    A solution of the left pattern is removed only when it is
+    compatible with a solution of the right pattern AND the two share
+    at least one bound variable.  When the patterns share no variables
+    nothing is ever removed, and incompatible bindings never remove
+    anything either.  Duplicate solutions of the left pattern are
+    preserved.
+
+    Evaluation is lazy: the left side is streamed and the right side is
+    only evaluated when it is actually needed, at most once, and never
+    at all when the two patterns share no variables.  The right side is
+    deliberately NOT collapsed into a set up front - that would force
+    full evaluation even when a LIMIT downstream stops iteration early,
+    and would discard the correlation context.
+    """
+    p1_vars = minus.p1._vars
+    p2_vars = minus.p2._vars
+    # None means the variables of one side are unknown; fall back to
+    # comparing whole solution mappings in that case.
+    shared: Optional[set[Variable]] = (
+        None if p1_vars is None or p2_vars is None else p1_vars & p2_vars
+    )
+
+    right: Optional[list[FrozenDict]] = None
+    for a in evalPart(ctx, minus.p1):
+        if shared is not None and not shared:
+            # No shared variables: domains can never overlap, so MINUS
+            # is the identity here and the right side is never run.
+            yield a
+            continue
+        if right is None:
+            right = list(evalPart(ctx, minus.p2))
+        if not any(_minusCompatible(a, b, shared) for b in right):
+            yield a
 
 
 def evalLeftJoin(
