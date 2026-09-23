@@ -4,8 +4,9 @@ Aggregation functions
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
-from decimal import Decimal
+from decimal import Decimal, getcontext, localcontext
 from typing import (
     Any,
     Optional,
@@ -19,7 +20,12 @@ from rdflib.plugins.sparql.datatypes import type_promotion
 from rdflib.plugins.sparql.evalutils import _eval, _val
 from rdflib.plugins.sparql.operators import numeric
 from rdflib.plugins.sparql.parserutils import CompValue
-from rdflib.plugins.sparql.sparql import FrozenBindings, NotBoundError, SPARQLTypeError
+from rdflib.plugins.sparql.sparql import (
+    FrozenBindings,
+    NotBoundError,
+    SPARQLError,
+    SPARQLTypeError,
+)
 from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
 
 
@@ -271,6 +277,198 @@ class GroupConcat(Accumulator):
         return Literal(self.separator.join(str(v) for v in self.value))
 
 
+def _percentile_context(
+    nums: Iterable[Union[int, Decimal, float]], p: Union[int, Decimal, float]
+):
+    """
+    A decimal context with enough precision to interpolate between the
+    given numbers without rounding high-precision decimals.
+    """
+    prec = 28
+    for n in list(nums) + [p]:
+        if isinstance(n, Decimal):
+            t = n.as_tuple()
+            if isinstance(t.exponent, int):
+                prec = max(prec, len(t.digits) + abs(t.exponent) + 10)
+    ctx = getcontext().copy()
+    ctx.prec = prec
+    return localcontext(ctx)
+
+
+def _strip_decimal(d: Decimal) -> Decimal:
+    """remove insignificant trailing zeros from a Decimal"""
+    if d == d.to_integral_value():
+        return d.quantize(Decimal(1))
+    return d.normalize()
+
+
+class Percentile(Accumulator):
+    """
+    Abstract base class for the PERCENTILE_CONT and PERCENTILE_DISC
+    aggregate extensions.
+
+    Syntax: PERCENTILE_CONT(p, expr) / PERCENTILE_DISC(p, expr)
+
+    p must evaluate to a number in [0, 1] that is invariant within each
+    group, otherwise a SPARQLError is raised. Rows where expr is unbound
+    or non-numeric are ignored, as are NaN values. DISTINCT (allowed
+    before p or before expr) is applied to the collected values before
+    the percentile is computed. An empty group leaves the result
+    variable unbound.
+    """
+
+    def __init__(self, aggregation: CompValue):
+        # DISTINCT may be written before p or before the value expression
+        if aggregation.distinct_value:
+            aggregation["distinct"] = aggregation.distinct_value
+        super(Percentile, self).__init__(aggregation)
+        self.p_expr = aggregation.p
+        self.p: Optional[Union[int, Decimal, float]] = None
+        self.values: list[tuple[Union[int, Decimal, float], Literal]] = []
+        self.datatype: Optional[URIRef] = None
+
+    def use_row(self, row: FrozenBindings) -> bool:
+        try:
+            return _eval(self.expr, row) not in self.seen
+        except NotBoundError:
+            # skip UNDEF
+            return False
+
+    def _eval_p(self, row: FrozenBindings) -> None:
+        try:
+            p_value = _eval(self.p_expr, row)
+        except NotBoundError:
+            raise SPARQLError("PERCENTILE: p is not bound")
+        try:
+            p = numeric(p_value)
+        except SPARQLTypeError:
+            raise SPARQLError("PERCENTILE: p must be numeric, got %r" % (p_value,))
+        if p != p:
+            raise SPARQLError("PERCENTILE: p must not be NaN")
+        if not 0 <= p <= 1:
+            raise SPARQLError("PERCENTILE: p must be in [0, 1], got %r" % (p,))
+        if self.p is None:
+            self.p = p
+        elif p != self.p:
+            raise SPARQLError("PERCENTILE: p must be invariant within a group")
+
+    def update(self, row: FrozenBindings, aggregator: Aggregator) -> None:
+        self._eval_p(row)
+        try:
+            value = _eval(self.expr, row)
+        except NotBoundError:
+            # skip UNDEF
+            return
+        try:
+            number = numeric(value)
+        except SPARQLTypeError:
+            # skip non-numeric values, as the other aggregates do
+            return
+        if number != number:
+            # NaN values are excluded from the sorted values
+            return
+        self.values.append((number, value))
+        dt = value.datatype
+        if dt is not None:
+            if self.datatype is None:
+                self.datatype = dt
+            else:
+                self.datatype = type_promotion(self.datatype, dt)
+        if self.distinct:
+            self.seen.add(value)
+
+    def sorted_values(self) -> list[tuple[Union[int, Decimal, float], Literal]]:
+        # sort on the native python numbers; Decimals are never converted
+        # to float, so high-precision decimals keep their exact order
+        return sorted(self.values, key=lambda item: item[0])
+
+    def set_value(self, bindings: MutableMapping[Variable, Identifier]) -> None:
+        value = self.get_value()
+        if value is not None:
+            # empty groups leave the variable unbound
+            bindings[self.var] = value
+
+
+class PercentileCont(Percentile):
+    """
+    PERCENTILE_CONT(p, expr): continuous percentile with interpolation.
+
+    For n sorted values the result is the value at 0-based position
+    p * (n - 1), linearly interpolated between neighbouring values.
+    p = 0 yields the minimum, p = 1 the maximum. The result type follows
+    SPARQL numeric type promotion of the input values: xsd:double if any
+    value is xsd:double, xsd:float if any value is xsd:float, otherwise
+    xsd:decimal. Interpolation is computed with Decimal arithmetic, so
+    high-precision decimals are never rounded through floats.
+    """
+
+    def get_value(self) -> Optional[Literal]:
+        if not self.values:
+            # empty group => unbound
+            return None
+        values = [number for number, _literal in self.sorted_values()]
+        n = len(values)
+        p = self.p
+        if p is None:
+            return None
+        if self.datatype in (XSD.float, XSD.double):
+            vals = [float(v) for v in values]
+            fpos = float(p) * (n - 1)
+            k = int(math.floor(fpos))
+            fraction = fpos - k
+            if k + 1 < n:
+                result = vals[k] + fraction * (vals[k + 1] - vals[k])
+            else:
+                result = vals[k]
+            return Literal(result, datatype=self.datatype)
+        with _percentile_context(values, p):
+            if isinstance(p, Decimal):
+                p_dec = p
+            elif isinstance(p, float):
+                p_dec = Decimal(str(p))
+            else:
+                p_dec = Decimal(p)
+            dpos = p_dec * (n - 1)
+            # dpos >= 0, so truncation is the same as floor
+            dk = int(dpos)
+            dfraction = dpos - dk
+            if dk + 1 < n:
+                dresult = Decimal(values[dk]) + dfraction * (
+                    Decimal(values[dk + 1]) - Decimal(values[dk])
+                )
+            else:
+                dresult = Decimal(values[dk])
+            dresult = _strip_decimal(dresult)
+        # format with fixed-point notation: str() of a Decimal may use
+        # scientific notation, which is not a valid xsd:decimal lexical form
+        return Literal(format(dresult, "f"), datatype=XSD.decimal)
+
+
+class PercentileDisc(Percentile):
+    """
+    PERCENTILE_DISC(p, expr): discrete percentile.
+
+    Returns the first value (in ascending order) whose cumulative
+    proportion reaches p, i.e. the value at 1-based position
+    max(1, ceil(p * n)). p = 0 yields the minimum, p = 1 the maximum.
+    The result is always one of the actual input values and keeps its
+    original datatype.
+    """
+
+    def get_value(self) -> Optional[Literal]:
+        if not self.values:
+            # empty group => unbound
+            return None
+        values = self.sorted_values()
+        n = len(values)
+        p = self.p
+        if p is None:
+            return None
+        index = max(math.ceil(p * n), 1) - 1
+        # return the original literal, preserving its datatype
+        return values[index][1]
+
+
 class Aggregator:
     """combines different Accumulator objects"""
 
@@ -282,6 +480,8 @@ class Aggregator:
         "Aggregate_Min": Minimum,
         "Aggregate_Max": Maximum,
         "Aggregate_GroupConcat": GroupConcat,
+        "Aggregate_PercentileCont": PercentileCont,
+        "Aggregate_PercentileDisc": PercentileDisc,
     }
 
     def __init__(self, aggregations: list[CompValue]):

@@ -712,9 +712,24 @@ NotExistsFunc = Comp(
 # | 'AVG' '(' Optional('DISTINCT') Expression ')'
 # | 'SAMPLE' '(' Optional('DISTINCT') Expression ')'
 # | 'GROUP_CONCAT' '(' Optional('DISTINCT') Expression ( ';' 'SEPARATOR' '=' String )? ')'
+# (extension) | 'PERCENTILE_CONT' '(' Optional('DISTINCT') Expression ',' Optional('DISTINCT') Expression ')'
+# (extension) | 'PERCENTILE_DISC' '(' Optional('DISTINCT') Expression ',' Optional('DISTINCT') Expression ')'
 
 _Distinct = Optional(Keyword("DISTINCT"))
 _AggregateParams = "(" + Param("distinct", _Distinct) + Param("vars", Expression) + ")"
+
+# PERCENTILE_CONT / PERCENTILE_DISC take the fraction p as first argument and
+# the value expression as second. DISTINCT may be given before p or before the
+# value expression; both apply to the collected values.
+_PercentileParams = (
+    "("
+    + Param("distinct", _Distinct)
+    + Param("p", Expression)
+    + ","
+    + Param("distinct_value", _Distinct)
+    + Param("vars", Expression)
+    + ")"
+)
 
 Aggregate = (
     Comp(
@@ -730,6 +745,12 @@ Aggregate = (
     | Comp("Aggregate_Max", Keyword("MAX") + _AggregateParams)
     | Comp("Aggregate_Avg", Keyword("AVG") + _AggregateParams)
     | Comp("Aggregate_Sample", Keyword("SAMPLE") + _AggregateParams)
+    | Comp(
+        "Aggregate_PercentileCont", Keyword("PERCENTILE_CONT") + _PercentileParams
+    )
+    | Comp(
+        "Aggregate_PercentileDisc", Keyword("PERCENTILE_DISC") + _PercentileParams
+    )
     | Comp(
         "Aggregate_GroupConcat",
         Keyword("GROUP_CONCAT")
