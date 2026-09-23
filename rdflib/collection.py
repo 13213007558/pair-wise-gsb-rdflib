@@ -9,7 +9,24 @@ from rdflib.term import BNode, Node
 if TYPE_CHECKING:
     from rdflib.graph import Graph
 
-__all__ = ["Collection"]
+__all__ = ["Collection", "MalformedCollectionError", "splice"]
+
+
+class MalformedCollectionError(ValueError):
+    """
+    Raised when an RDF collection (an ``rdf:List`` chain) is structurally
+    invalid, for example when a chain node is missing its ``rdf:first`` or
+    ``rdf:rest`` arc, has more than one of either, when the chain contains
+    a cycle, or when a chain node is not a list node at all.
+
+    The offending node is available as ``node`` and a human readable
+    explanation as ``reason``.
+    """
+
+    def __init__(self, node: Node, reason: str):
+        self.node: Node = node
+        self.reason: str = reason
+        super().__init__(f"Malformed RDF collection at node {node!r}: {reason}")
 
 
 class Collection:
@@ -281,3 +298,140 @@ class Collection:
             graph.remove((container, RDF.rest, None))
             container = rest
         return self
+
+
+def _unique_predicate_object(graph: Graph, node: Node, predicate: Node) -> Node:
+    """
+    Return the single object of ``(node, predicate, ...)`` in ``graph``,
+    raising ``MalformedCollectionError`` naming ``node`` if there is not
+    exactly one.
+    """
+    objects = list(graph.objects(node, predicate))
+    if not objects:
+        raise MalformedCollectionError(node, f"missing {predicate.n3()} arc")
+    if len(objects) > 1:
+        raise MalformedCollectionError(
+            node, f"multiple {predicate.n3()} arcs ({len(objects)} found)"
+        )
+    return objects[0]
+
+
+def _normalize_slice_index(index: int, length: int) -> int:
+    """
+    Normalize ``index`` the way Python sequence slicing does: negative
+    indices count back from the end, and the result is clamped to
+    ``[0, length]``.
+    """
+    if index < 0:
+        index += length
+        if index < 0:
+            index = 0
+    elif index > length:
+        index = length
+    return index
+
+
+def splice(
+    graph: Graph,
+    head: Node,
+    start: int,
+    stop: int,
+    values: Iterable[Node] = (),
+) -> Node:
+    """
+    Splice an RDF collection without modifying any existing list structure.
+
+    Returns the head of a new list that is a copy of the list headed by
+    ``head`` with the half-open interval ``[start, stop)`` replaced by
+    ``values``.  The original chain is left completely untouched, so any
+    other list that shares nodes with it (for example a common ``rdf:rest``
+    tail) keeps working unchanged; it is up to the caller to decide whether
+    external references to ``head`` should be updated to the returned head.
+
+    Only the chain nodes that must change are newly allocated blank nodes:
+    the nodes before ``start`` (their ``rdf:rest`` pointers have to be
+    redirected) and one node per inserted value.  The untouched tail starting
+    at ``stop`` is shared with the original list, not copied.
+
+    ``start`` and ``stop`` follow Python's slice rules: negative
+    indices count back from the end of the list, indices beyond the list are
+    clamped to its length, indices below ``-len(list)`` are clamped to
+    ``0``, and if ``stop`` ends up before ``start`` it is treated
+    as equal to ``start`` (a pure insertion at ``start``).  Some
+    consequences:
+
+    - ``splice(graph, head, i, i, values)`` inserts ``values`` before
+      index ``i``; ``i = 0`` inserts at the head and ``i = len``
+      (or any larger value) appends at the tail.
+    - ``splice(graph, head, start, stop)`` with no ``values`` deletes
+      the interval.
+    - Splicing into ``RDF.nil`` (the empty list) inserts ``values``.
+    - Deleting everything yields ``RDF.nil`` as the new head.
+
+    ``values`` may contain any RDF term, including duplicate values and
+    blank nodes.
+
+    Before anything is added to ``graph``, the whole chain reachable from
+    ``head`` is validated: every chain node must have exactly one
+    ``rdf:first`` and exactly one ``rdf:rest`` arc, the chain must end
+    at ``RDF.nil``, and it must not contain a cycle.  Any violation raises
+    ``MalformedCollectionError`` identifying the offending node, and the
+    graph is left exactly as it was found - no half-built new chain is left
+    behind.
+
+    Only ``graph`` is ever read or written; if ``graph`` is one context
+    of a ``Dataset``, same-named nodes in the dataset's other graphs are
+    neither consulted nor modified.
+
+    ```python
+    >>> from rdflib import Graph, Literal
+    >>> from rdflib.collection import Collection, splice
+    >>> g = Graph()
+    >>> head = BNode()
+    >>> Collection(g, head, [Literal(1), Literal(2), Literal(3)])
+    <rdflib.collection.Collection object at ...>
+    >>> new_head = splice(g, head, 1, 2, [Literal(20), Literal(21)])
+    >>> list(Collection(g, new_head)) == [Literal(1), Literal(20), Literal(21), Literal(3)]
+    True
+    >>> list(Collection(g, head)) == [Literal(1), Literal(2), Literal(3)]  # unchanged
+    True
+
+    ```
+    """
+    values = list(values)
+
+    # Traverse and validate the whole chain before touching the graph, so a
+    # malformed list cannot leave a half-built new chain behind.
+    nodes: list[Node] = []
+    firsts: list[Node] = []
+    seen: set[Node] = set()
+    node: Node = head
+    while node != RDF.nil:
+        if node in seen:
+            raise MalformedCollectionError(
+                node, "cycle detected: node is reachable from itself via rdf:rest"
+            )
+        seen.add(node)
+        firsts.append(_unique_predicate_object(graph, node, RDF.first))
+        rest = _unique_predicate_object(graph, node, RDF.rest)
+        nodes.append(node)
+        node = rest
+
+    length = len(nodes)
+    start = _normalize_slice_index(start, length)
+    stop = _normalize_slice_index(stop, length)
+    if stop < start:
+        stop = start
+
+    # The tail starting at "stop" is unaffected and shared with the original
+    # list; everything before it is rebuilt with new blank nodes.
+    suffix_head: Node = nodes[stop] if stop < length else RDF.nil
+    new_nodes: list[Node] = [BNode() for _ in range(start + len(values))]
+    new_firsts: list[Node] = firsts[:start] + values
+
+    chain: list[Node] = new_nodes + [suffix_head]
+    for current, first, rest in zip(new_nodes, new_firsts, chain[1:]):
+        graph.add((current, RDF.first, first))
+        graph.add((current, RDF.rest, rest))
+
+    return new_nodes[0] if new_nodes else suffix_head
