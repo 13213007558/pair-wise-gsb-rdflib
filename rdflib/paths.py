@@ -171,26 +171,58 @@ No vars specified:
  (rdflib.term.URIRef('ex:h'), rdflib.term.URIRef('ex:a'))]
 
 ```
+
+Shortest witnesses
+
+When debugging data it is not enough to know that two nodes are connected
+by a path expression; eval_path_witness (also available as the
+Path.eval_witness method) additionally returns one shortest witness per
+endpoint pair: the graph triples crossed, in traversal order, each tagged
+with the direction of traversal. Zero-length matches have an empty witness.
+
+>>> from rdflib.paths import eval_path_witness
+
+>>> [(s, o, len(w)) for s, o, w in eval_path_witness(g, (e.a, e.p1/e.p2, None))]
+[(rdflib.term.URIRef('ex:a'), rdflib.term.URIRef('ex:e'), 2)]
+
+>>> list(eval_path_witness(g, (e.c, e.p3*ZeroOrMore, e.c)))
+[(rdflib.term.URIRef('ex:c'), rdflib.term.URIRef('ex:c'), ())]
+
+>>> s, o, w = next(iter(eval_path_witness(g, (e.e, ~(e.p1/e.p2), None))))
+>>> (s, o) == (e.e, e.a)
+True
+>>> [(st.predicate, st.forward) for st in w]
+[(rdflib.term.URIRef('ex:p2'), False), (rdflib.term.URIRef('ex:p1'), False)]
+
 """
 
 from __future__ import annotations
 
 import warnings
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable, Generator, Iterator
 from functools import total_ordering
 from typing import (
     TYPE_CHECKING,
     Any,
+    NamedTuple,
     Optional,
     Union,
+    cast,
 )
 
 from rdflib.term import Node, URIRef
 
 if TYPE_CHECKING:
     from rdflib._type_checking import _MulPathMod
-    from rdflib.graph import Graph, _ObjectType, _PredicateType, _SubjectType
+    from rdflib.graph import (
+        Graph,
+        _ObjectType,
+        _PredicateType,
+        _SubjectType,
+        _TripleType,
+    )
     from rdflib.namespace import NamespaceManager
 
 
@@ -199,6 +231,22 @@ if TYPE_CHECKING:
 ZeroOrMore = "*"
 OneOrMore = "+"
 ZeroOrOne = "?"
+
+
+class WitnessStep(NamedTuple):
+    """
+    A single step of a path witness.
+
+    ``(subject, predicate, object)`` is a triple of the queried graph, in its
+    original orientation. ``forward`` is ``True`` if the step traverses the
+    triple from subject to object, and ``False`` if it traverses it from
+    object to subject (i.e. via an inverse path).
+    """
+
+    subject: _SubjectType
+    predicate: _PredicateType
+    object: _ObjectType
+    forward: bool
 
 
 def _n3(
@@ -226,6 +274,21 @@ class Path(ABC):
         subj: Optional[_SubjectType] = None,
         obj: Optional[_ObjectType] = None,
     ) -> Iterator[tuple[_SubjectType, _ObjectType]]: ...
+
+    def eval_witness(
+        self,
+        graph: Graph,
+        subj: Optional[_SubjectType] = None,
+        obj: Optional[_ObjectType] = None,
+    ) -> Iterator[tuple[_SubjectType, _ObjectType, tuple[WitnessStep, ...]]]:
+        """
+        Evaluate this path on the given graph, yielding, for every reachable
+        endpoint, the endpoint pair together with one shortest witness.
+
+        This is a convenience wrapper around :func:`eval_path_witness`;
+        see there for the exact semantics.
+        """
+        return eval_path_witness(graph, (subj, self, obj))
 
     @abstractmethod
     def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str: ...
@@ -575,6 +638,288 @@ def neg_path(p: Union[URIRef, AlternativePath, InvPath]) -> NegatedPath:
     negated path
     """
     return NegatedPath(p)
+
+
+class _EdgeMatcher(ABC):
+    """Matches a single RDF edge of a path NFA against a graph."""
+
+    @abstractmethod
+    def matches(
+        self, graph: Graph, node: Node
+    ) -> Iterator[tuple[Node, _TripleType, bool]]:
+        """
+        Yield ``(next_node, triple, forward)`` for every graph triple that
+        this matcher can traverse starting at ``node``. ``triple`` is kept
+        in its original graph orientation; ``forward`` records the direction
+        of traversal.
+        """
+
+
+class _ForwardMatcher(_EdgeMatcher):
+    def __init__(self, predicate: _PredicateType):
+        self.predicate = predicate
+
+    def matches(
+        self, graph: Graph, node: Node
+    ) -> Iterator[tuple[Node, _TripleType, bool]]:
+        for s, p, o in graph.triples((node, self.predicate, None)):
+            yield o, (s, p, o), True
+
+
+class _BackwardMatcher(_EdgeMatcher):
+    def __init__(self, predicate: _PredicateType):
+        self.predicate = predicate
+    def matches(
+        self, graph: Graph, node: Node
+    ) -> Iterator[tuple[Node, _TripleType, bool]]:
+        for s, p, o in graph.triples((None, self.predicate, node)):
+            yield s, (s, p, o), False
+
+
+class _NegatedMatcher(_EdgeMatcher):
+    """Matches one edge of a :class:`NegatedPath`, in either direction."""
+
+    def __init__(
+        self, args: list[Union[URIRef, Path]], reversed_: bool = False
+    ):
+        self.forward_excluded: set[URIRef] = set()
+        self.backward_excluded: list[Union[URIRef, Path]] = []
+        for a in args:
+            if isinstance(a, URIRef):
+                self.forward_excluded.add(a)
+            elif isinstance(a, InvPath):
+                self.backward_excluded.append(a.arg)
+            else:
+                raise Exception("Invalid path in NegatedPath: %s" % a)
+        self.reversed = reversed_
+
+    def matches(
+        self, graph: Graph, node: Node
+    ) -> Iterator[tuple[Node, _TripleType, bool]]:
+        if self.reversed:
+            for s, p, o in graph.triples((None, None, node)):
+                if p in self.forward_excluded:
+                    continue
+                if any((node, q, s) in graph for q in self.backward_excluded):
+                    continue
+                yield s, (s, p, o), False
+        else:
+            for s, p, o in graph.triples((node, None, None)):
+                if p in self.forward_excluded:
+                    continue
+                if any((o, q, s) in graph for q in self.backward_excluded):
+                    continue
+                yield o, (s, p, o), True
+
+
+class _PathNFA:
+    """
+    A NFA (Thompson's construction) over :class:`_EdgeMatcher` transitions.
+
+    Transitions with a ``None`` matcher are epsilon transitions.
+    """
+
+    def __init__(self) -> None:
+        self.transitions: list[list[tuple[Optional[_EdgeMatcher], int]]] = []
+
+    def new_state(self) -> int:
+        self.transitions.append([])
+        return len(self.transitions) - 1
+
+    def add(
+        self, source: int, matcher: Optional[_EdgeMatcher], target: int
+    ) -> None:
+        self.transitions[source].append((matcher, target))
+
+    def epsilon_closures(self) -> list[frozenset[int]]:
+        closures = []
+        for state in range(len(self.transitions)):
+            seen = {state}
+            stack = [state]
+            while stack:
+                current = stack.pop()
+                for matcher, target in self.transitions[current]:
+                    if matcher is None and target not in seen:
+                        seen.add(target)
+                        stack.append(target)
+            closures.append(frozenset(seen))
+        return closures
+
+
+def _compile_path(
+    path: Union[Path, _PredicateType], nfa: _PathNFA, reversed_: bool = False
+) -> tuple[int, int]:
+    """
+    Compile ``path`` into ``nfa``, returning its ``(start, accept)`` states.
+
+    With ``reversed_`` the NFA matches the path backwards, i.e. from objects
+    to subjects; every edge matcher then traverses triples in the opposite
+    direction.
+    """
+    if isinstance(path, InvPath):
+        return _compile_path(path.arg, nfa, not reversed_)
+    if isinstance(path, SequencePath):
+        args = path.args[::-1] if reversed_ else path.args
+        start, accept = _compile_path(args[0], nfa, reversed_)
+        for arg in args[1:]:
+            next_start, next_accept = _compile_path(arg, nfa, reversed_)
+            nfa.add(accept, None, next_start)
+            accept = next_accept
+        return start, accept
+    if isinstance(path, AlternativePath):
+        start, accept = nfa.new_state(), nfa.new_state()
+        for arg in path.args:
+            arg_start, arg_accept = _compile_path(arg, nfa, reversed_)
+            nfa.add(start, None, arg_start)
+            nfa.add(arg_accept, None, accept)
+        return start, accept
+    if isinstance(path, MulPath):
+        start, accept = nfa.new_state(), nfa.new_state()
+        inner_start, inner_accept = _compile_path(path.path, nfa, reversed_)
+        nfa.add(start, None, inner_start)
+        nfa.add(inner_accept, None, accept)
+        if path.zero:
+            nfa.add(start, None, accept)
+        if path.more:
+            nfa.add(inner_accept, None, inner_start)
+        return start, accept
+    if isinstance(path, NegatedPath):
+        start, accept = nfa.new_state(), nfa.new_state()
+        nfa.add(start, _NegatedMatcher(path.args, reversed_), accept)
+        return start, accept
+    # anything else is a plain predicate, matching a single forward edge
+    start, accept = nfa.new_state(), nfa.new_state()
+    matcher: _EdgeMatcher
+    if reversed_:
+        matcher = _BackwardMatcher(cast("_PredicateType", path))
+    else:
+        matcher = _ForwardMatcher(cast("_PredicateType", path))
+    nfa.add(start, matcher, accept)
+    return start, accept
+
+
+def _bfs_witnesses(
+    graph: Graph,
+    nfa: _PathNFA,
+    closures: list[frozenset[int]],
+    start: int,
+    accept: int,
+    source: _SubjectType,
+    target: Optional[_ObjectType] = None,
+) -> Iterator[tuple[_ObjectType, tuple[WitnessStep, ...]]]:
+    """
+    Breadth-first search from ``source`` over (graph node, NFA state) pairs.
+
+    Yields ``(endpoint, witness)`` for every reachable endpoint exactly once,
+    in non-decreasing order of witness length; the first witness found for an
+    endpoint crosses a minimal number of RDF edges. Cycles cannot cause
+    non-termination because every (node, state set) pair is expanded at most
+    once.
+    """
+    start_states = closures[start]
+    visited = {(source, start_states)}
+    queue: deque[tuple[Node, frozenset[int], tuple[WitnessStep, ...]]] = deque(
+        [(source, start_states, ())]
+    )
+    yielded = set()
+    if accept in start_states and (target is None or source == target):
+        yielded.add(source)
+        yield source, ()
+        if target is not None:
+            return
+    while queue:
+        node, states, witness = queue.popleft()
+        for state in states:
+            for matcher, next_state in nfa.transitions[state]:
+                if matcher is None:
+                    continue
+                for next_node, triple, forward in matcher.matches(graph, node):
+                    next_states = closures[next_state]
+                    key = (next_node, next_states)
+                    if key in visited:
+                        continue
+                    visited.add(key)
+                    next_witness = witness + (
+                        WitnessStep(triple[0], triple[1], triple[2], forward),
+                    )
+                    if (
+                        accept in next_states
+                        and next_node not in yielded
+                        and (target is None or next_node == target)
+                    ):
+                        yielded.add(next_node)
+                        yield next_node, next_witness
+                        if target is not None:
+                            return
+                    queue.append((next_node, next_states, next_witness))
+
+
+def eval_path_witness(
+    graph: Graph,
+    t: tuple[
+        Optional[_SubjectType],
+        Union[Path, _PredicateType],
+        Optional[_ObjectType],
+    ],
+) -> Iterator[tuple[_SubjectType, _ObjectType, tuple[WitnessStep, ...]]]:
+    """
+    Evaluate a path expression on ``graph`` and return, for every reachable
+    endpoint pair, one shortest witness.
+
+    Like :func:`eval_path`, the pattern ``t`` is a ``(subject, path, object)``
+    triple in which subject and/or object may be ``None``. For every
+    ``(subject, object)`` pair connected by the path expression, a single
+    tuple ``(subject, object, witness)`` is yielded. ``witness`` is a tuple
+    of :class:`WitnessStep` listing, in traversal order, the graph triples
+    crossed along one shortest matching walk, each tagged with the direction
+    it is traversed in. Shortest is measured in the number of RDF edges
+    crossed, so zero-length matches (e.g. of ``path*`` or ``path?``) have an
+    empty witness. If several shortest witnesses exist for a pair, an
+    arbitrary one is returned.
+
+    The search is a breadth-first search over the expression itself, so
+    every step of a witness satisfies the expression, and cycles or
+    zero-length-capable expressions cannot cause non-termination.
+
+    Only the graph passed in is consulted: when a :class:`~rdflib.Dataset`
+    context (named graph) is passed, witnesses never combine triples from
+    other contexts.
+    """
+    subj, path, obj = t
+    nfa = _PathNFA()
+    if subj is not None:
+        start, accept = _compile_path(path, nfa)
+        closures = nfa.epsilon_closures()
+        for end, witness in _bfs_witnesses(
+            graph, nfa, closures, start, accept, subj, obj
+        ):
+            yield subj, end, witness
+    elif obj is not None:
+        # match the path backwards from the object, then flip the witness
+        start, accept = _compile_path(path, nfa, reversed_=True)
+        closures = nfa.epsilon_closures()
+        for end, witness in _bfs_witnesses(
+            graph, nfa, closures, start, accept, obj, None
+        ):
+            yield end, obj, tuple(
+                WitnessStep(
+                    step.subject, step.predicate, step.object, not step.forward
+                )
+                for step in reversed(witness)
+            )
+    else:
+        start, accept = _compile_path(path, nfa)
+        closures = nfa.epsilon_closures()
+        seen_sources = set()
+        for s, o in graph.subject_objects(None):
+            for source in (s, o):
+                if source in seen_sources:
+                    continue
+                seen_sources.add(source)
+                for end, witness in _bfs_witnesses(
+                    graph, nfa, closures, start, accept, source, None
+                ):
+                    yield source, end, witness
 
 
 if __name__ == "__main__":
