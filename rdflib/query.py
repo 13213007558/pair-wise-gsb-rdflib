@@ -343,6 +343,20 @@ class Result:
             # type error: Argument 1 to "len" has incompatible type "Optional[Graph]"; expected "Sized"
             return len(self.graph)  # type: ignore[arg-type]
 
+    def close(self) -> None:
+        """
+        Close this result, releasing the underlying iterator if it has not
+        been fully consumed yet.
+
+        Rows that were already consumed remain available, and execution
+        statistics collected during iteration stay readable afterwards.
+        """
+        if self._genbindings is not None:
+            close = getattr(self._genbindings, "close", None)
+            if close is not None:
+                close()
+            self._genbindings = None
+
     def __bool__(self) -> bool:
         if self.type == "ASK":
             # type error: Incompatible return value type (got "Optional[bool]", expected "bool")

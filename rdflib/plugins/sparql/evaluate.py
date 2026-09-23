@@ -18,7 +18,7 @@ from __future__ import annotations
 import collections
 import itertools
 import re
-from collections.abc import Generator, Iterable, Mapping
+from collections.abc import Generator, Iterable, Mapping, MutableMapping
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -50,6 +50,7 @@ from rdflib.plugins.sparql.sparql import (
     QueryContext,
     SPARQLError,
 )
+from rdflib.plugins.sparql.stats import QueryStats
 from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
 
 if TYPE_CHECKING:
@@ -269,6 +270,10 @@ def evalMultiset(ctx: QueryContext, part: CompValue):
 
 
 def evalPart(ctx: QueryContext, part: CompValue) -> Any:
+    collector = getattr(ctx, "stats_collector", None)
+    if collector is not None:
+        return collector.eval_part(ctx, part, CUSTOM_EVALS, _evalPartBuiltin)
+
     # try custom evaluation functions
     for name, c in CUSTOM_EVALS.items():
         try:
@@ -276,6 +281,10 @@ def evalPart(ctx: QueryContext, part: CompValue) -> Any:
         except NotImplementedError:
             pass  # the given custome-function did not handle this part
 
+    return _evalPartBuiltin(ctx, part)
+
+
+def _evalPartBuiltin(ctx: QueryContext, part: CompValue) -> Any:
     if part.name == "BGP":
         # Reorder triples patterns by number of bound nodes in the current ctx
         # Do patterns with more bound nodes first
@@ -649,8 +658,17 @@ def evalQuery(
     query: Query,
     initBindings: Optional[Mapping[str, Identifier]] = None,
     base: Optional[str] = None,
+    stats: Union[bool, QueryStats, None] = None,
 ) -> Mapping[Any, Any]:
     """Evaluate a SPARQL query against a graph.
+
+    Args:
+        stats: pass ``True`` or a
+            :class:`~rdflib.plugins.sparql.stats.QueryStats` instance to
+            collect execution statistics for this query evaluation.
+            The report is attached to the result mapping and to the
+            resulting :class:`~rdflib.plugins.sparql.processor.SPARQLResult`
+            as ``stats``.
 
     !!! warning "Caution"
 
@@ -675,4 +693,12 @@ def evalQuery(
 
     ctx.prologue = query.prologue
 
-    return evalPart(ctx, main)
+    if stats:
+        ctx.stats_collector = stats if isinstance(stats, QueryStats) else QueryStats()
+
+    res = evalPart(ctx, main)
+
+    if ctx.stats_collector is not None and isinstance(res, MutableMapping):
+        res["stats"] = ctx.stats_collector
+
+    return res

@@ -7,7 +7,7 @@ These should be automatically registered with RDFLib
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from rdflib.graph import Graph
 from rdflib.plugins.sparql.algebra import translateQuery, translateUpdate
@@ -17,6 +17,9 @@ from rdflib.plugins.sparql.sparql import Query, Update
 from rdflib.plugins.sparql.update import evalUpdate
 from rdflib.query import Processor, Result, UpdateProcessor
 from rdflib.term import Identifier
+
+if TYPE_CHECKING:
+    from rdflib.plugins.sparql.stats import QueryStats
 
 
 def prepareQuery(
@@ -73,6 +76,9 @@ class SPARQLResult(Result):
         self.bindings = res.get("bindings")  # type: ignore[assignment]
         self.askAnswer = res.get("askAnswer")
         self.graph = res.get("graph")
+        #: execution statistics of this query evaluation, only present
+        #: when statistics collection was enabled with ``stats``
+        self.stats: Optional[QueryStats] = res.get("stats")
 
 
 class SPARQLUpdateProcessor(UpdateProcessor):
@@ -121,11 +127,17 @@ class SPARQLProcessor(Processor):
         initNs: Optional[Mapping[str, Any]] = None,
         base: Optional[str] = None,
         DEBUG: bool = False,
+        stats: Union[bool, QueryStats, None] = None,
     ) -> Mapping[str, Any]:
         """
         Evaluate a query with the given initial bindings, and initial
         namespaces. The given base is used to resolve relative URIs in
         the query and will be overridden by any BASE given in the query.
+
+        Pass ``stats=True`` or a
+        :class:`~rdflib.plugins.sparql.stats.QueryStats` instance to
+        collect execution statistics for this query evaluation; the
+        report is available as ``stats`` on the returned result.
 
         !!! warning "Caution"
 
@@ -144,4 +156,4 @@ class SPARQLProcessor(Processor):
         if isinstance(strOrQuery, str):
             strOrQuery = translateQuery(parseQuery(strOrQuery), base, initNs)
 
-        return evalQuery(self.graph, strOrQuery, initBindings, base)
+        return evalQuery(self.graph, strOrQuery, initBindings, base, stats=stats)
