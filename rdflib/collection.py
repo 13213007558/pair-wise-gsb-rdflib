@@ -4,12 +4,17 @@ from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Optional
 
 from rdflib.namespace import RDF
-from rdflib.term import BNode, Node
+from rdflib.term import BNode, Literal, Node
 
 if TYPE_CHECKING:
     from rdflib.graph import Graph
 
-__all__ = ["Collection"]
+__all__ = ["Collection", "CollectionError"]
+
+
+class CollectionError(ValueError):
+    """Raised when an RDF Collection is malformed or when an edit would
+    rewrite chain nodes that are shared with another collection."""
 
 
 class Collection:
@@ -281,3 +286,283 @@ class Collection:
             graph.remove((container, RDF.rest, None))
             container = rest
         return self
+
+    def _validated_chain(self) -> tuple[list[Node], list[Node]]:
+        """
+        Walk the chain from the entry node and return the chain nodes and
+        their ``rdf:first`` values.
+
+        Raises :class:`CollectionError` if the chain is malformed: a node
+        with a missing or repeated ``rdf:first``/``rdf:rest``, or a cycle.
+        An entry node without any ``rdf:first``/``rdf:rest`` triples heads
+        the empty list.
+        """
+        graph = self.graph
+        cells: list[Node] = []
+        firsts: list[Node] = []
+        seen: set[Node] = set()
+        cell: Node = self.uri
+        while cell != RDF.nil:
+            if cell in seen:
+                raise CollectionError(
+                    "Malformed RDF Collection: cycle detected at %s" % cell.n3()
+                )
+            seen.add(cell)
+            first_values = list(graph.objects(cell, RDF.first))
+            rest_values = list(graph.objects(cell, RDF.rest))
+            if not cells and not first_values and not rest_values:
+                # The entry node holds no chain triples at all: the empty list.
+                break
+            if len(first_values) != 1:
+                raise CollectionError(
+                    "Malformed RDF Collection: %s has %d rdf:first values"
+                    % (cell.n3(), len(first_values))
+                )
+            if len(rest_values) != 1:
+                raise CollectionError(
+                    "Malformed RDF Collection: %s has %d rdf:rest values"
+                    % (cell.n3(), len(rest_values))
+                )
+            cells.append(cell)
+            firsts.append(first_values[0])
+            cell = rest_values[0]
+        return cells, firsts
+
+    def _shared_flags(self, cells: list[Node]) -> list[bool]:
+        """
+        Flag each chain node that is shared with the world outside this
+        collection.
+
+        A node is shared if anything other than its chain predecessor points
+        at it (another list's ``rdf:rest``, or any external reference), or if
+        it sits behind an already shared node, since it is then reachable
+        through that node's ``rdf:rest``.
+        """
+        graph = self.graph
+        shared: list[bool] = []
+        previous: Optional[Node] = None
+        behind_shared = False
+        for cell in cells:
+            if previous is None:
+                # Ordinary references to the list head are fine; the entry
+                # node is only shared if another list's rdf:rest points at it.
+                direct = (None, RDF.rest, cell) in graph
+            else:
+                direct = any(
+                    (subject, predicate) != (previous, RDF.rest)
+                    for subject, predicate in graph.subject_predicates(cell)
+                )
+            behind_shared = behind_shared or direct
+            shared.append(behind_shared)
+            previous = cell
+        return shared
+
+    def _new_cell(self, first: Node) -> Node:
+        cell = BNode()
+        self.graph.add((cell, RDF.first, first))
+        return cell
+
+    def _ghost_cell(self, first: Node, rest: Node) -> Node:
+        cell = BNode()
+        self.graph.add((cell, RDF.first, first))
+        self.graph.add((cell, RDF.rest, rest))
+        return cell
+
+    def _copy_cell(self, cell: Node) -> Node:
+        """Copy a chain node, replicating its ``rdf:first`` and any
+        non-first/rest annotations; the ``rdf:rest`` is wired up later."""
+        clone = BNode()
+        for predicate, obj in self.graph.predicate_objects(cell):
+            if predicate != RDF.rest:
+                self.graph.add((clone, predicate, obj))
+        return clone
+
+    def _link_cells(self, anchor: Node, segment: list[Node], tail: Node) -> None:
+        """Point ``anchor`` at ``segment`` and chain it through to ``tail``."""
+        graph = self.graph
+        graph.set((anchor, RDF.rest, segment[0] if segment else tail))
+        for index, cell in enumerate(segment):
+            nxt = segment[index + 1] if index + 1 < len(segment) else tail
+            graph.set((cell, RDF.rest, nxt))
+
+    def splice(
+        self,
+        start: int,
+        delete_count: int = 0,
+        values: Iterable[Node] = (),
+        *,
+        detach: bool = False,
+    ) -> list[Node]:
+        """
+        Splice the collection like JavaScript's ``Array.prototype.splice``:
+        delete ``delete_count`` items starting at index ``start``, insert
+        ``values`` in their place, and return the deleted items.
+
+        The whole chain is validated before anything is modified, so a
+        malformed list (a missing or repeated ``rdf:first``/``rdf:rest``, a
+        cycle) or an out-of-range ``start``/``delete_count`` raises without
+        leaving a half-applied edit behind.
+
+        Chain nodes are often shared between collections (one list's tail
+        being another list's suffix). By default, if the edit would rewrite
+        or remove a shared chain node, :class:`CollectionError` is raised
+        and the graph is left untouched. With ``detach=True`` only the chain
+        nodes from this collection's entry up to the necessary fork point
+        are copied, so the other collection keeps pointing at the original
+        tail.
+
+        Preservation rules:
+
+        * The entry resource (``self.uri``) is never replaced; the edit
+          always keeps the same entry node, so references to it stay valid.
+          If the entry node itself is the tail of another list, splicing
+          it is rejected even with ``detach=True``.
+        * Inserted values are referenced as-is; the resources in the graph
+          are never copied.
+        * Non-first/rest annotations on the entry node always stay on the
+          entry node. Annotations on a chain node copied during a detach
+          are replicated on the copy. Annotations on removed nodes are
+          removed along with them; annotations on shared nodes are never
+          touched.
+
+        ```python
+        >>> from rdflib.term import Literal
+        >>> from rdflib.graph import Graph
+        >>> from rdflib.namespace import RDF
+        >>> g = Graph()
+        >>> s0, s1 = BNode(), BNode()
+        >>> _ = g.add((s0, RDF.first, Literal(3)))
+        >>> _ = g.add((s0, RDF.rest, s1))
+        >>> _ = g.add((s1, RDF.first, Literal(4)))
+        >>> _ = g.add((s1, RDF.rest, RDF.nil))
+        >>> a = Collection(g, BNode(), [Literal(1), Literal(2)])
+        >>> _ = g.set((a._end(), RDF.rest, s0))
+        >>> b = Collection(g, BNode(), [Literal(9)])
+        >>> _ = g.set((b._end(), RDF.rest, s0))
+        >>> [int(v) for v in a]
+        [1, 2, 3, 4]
+        >>> [int(v) for v in b]
+        [9, 3, 4]
+        >>> a.splice(3, 1)  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+        ...
+        rdflib.collection.CollectionError: Refusing to splice ...
+        >>> deleted = a.splice(3, 1, [Literal(7)], detach=True)
+        >>> [int(v) for v in deleted]
+        [4]
+        >>> [int(v) for v in a]
+        [1, 2, 3, 7]
+        >>> [int(v) for v in b]
+        [9, 3, 4]
+
+        ```
+        """
+        graph = self.graph
+        if self.uri == RDF.nil:
+            raise ValueError("Cannot splice the empty list (rdf:nil)")
+        new_values = list(values)
+        cells, firsts = self._validated_chain()
+        size = len(cells)
+        if start < 0 or start > size:
+            raise IndexError(
+                "splice start %r out of range for collection of length %d"
+                % (start, size)
+            )
+        if delete_count < 0 or start + delete_count > size:
+            raise IndexError(
+                "splice delete_count %r out of range for collection of length %d"
+                % (delete_count, size)
+            )
+        deleted = firsts[start : start + delete_count]
+        if delete_count == 0 and not new_values:
+            return []
+        if size == 0:
+            # The empty list: only start == 0, delete_count == 0 gets here.
+            if isinstance(self.uri, Literal):
+                raise CollectionError(
+                    "Cannot splice %s: a literal cannot head a chain" % self.uri.n3()
+                )
+            segment = [self._new_cell(value) for value in new_values[1:]]
+            graph.add((self.uri, RDF.first, new_values[0]))
+            self._link_cells(self.uri, segment, RDF.nil)
+            return []
+
+        shared = self._shared_flags(cells)
+        fork_index = start + delete_count
+
+        def _shared_cell_error(cell: Node) -> CollectionError:
+            return CollectionError(
+                "Refusing to splice %s: chain node %s is shared with another "
+                "collection; pass detach=True to copy the shared prefix and "
+                "leave the other collection's tail untouched"
+                % (self.uri.n3(), cell.n3())
+            )
+
+        if start > 0:
+            anchor_index = start - 1
+            while anchor_index > 0 and shared[anchor_index]:
+                anchor_index -= 1
+            if shared[anchor_index]:
+                raise CollectionError(
+                    "Cannot splice %s: the entry node is the tail of another "
+                    "list and cannot be detached or rewritten in place" % self.uri.n3()
+                )
+            if not detach and anchor_index != start - 1:
+                raise _shared_cell_error(cells[start - 1])
+            removed = range(start, fork_index)
+        else:
+            if shared[0]:
+                raise CollectionError(
+                    "Cannot splice %s: the entry node is the tail of another "
+                    "list and cannot be detached or rewritten in place" % self.uri.n3()
+                )
+            if delete_count == size or new_values:
+                removed = range(1, delete_count)
+            elif shared[fork_index]:
+                if not detach:
+                    raise _shared_cell_error(cells[fork_index])
+                removed = range(1, delete_count)
+            else:
+                # The fork node is consumed: its content moves to the entry.
+                removed = range(1, delete_count + 1)
+        if not detach:
+            for i in removed:
+                if shared[i]:
+                    raise _shared_cell_error(cells[i])
+
+        if start > 0:
+            segment = [
+                self._copy_cell(cells[i]) for i in range(anchor_index + 1, start)
+            ]
+            segment.extend(self._new_cell(value) for value in new_values)
+            tail = cells[fork_index] if fork_index < size else RDF.nil
+            self._link_cells(cells[anchor_index], segment, tail)
+        elif new_values:
+            entry = cells[0]
+            if delete_count == 0:
+                # The old head content moves into a fresh cell behind the
+                # inserted values; the entry's annotations stay on the entry.
+                tail = self._ghost_cell(firsts[0], cells[1] if size > 1 else RDF.nil)
+            else:
+                tail = cells[fork_index] if fork_index < size else RDF.nil
+            segment = [self._new_cell(value) for value in new_values[1:]]
+            graph.set((entry, RDF.first, new_values[0]))
+            self._link_cells(entry, segment, tail)
+        elif delete_count == size:
+            entry = cells[0]
+            graph.remove((entry, RDF.first, None))
+            graph.remove((entry, RDF.rest, None))
+        else:
+            entry = cells[0]
+            graph.set((entry, RDF.first, firsts[fork_index]))
+            graph.set(
+                (
+                    entry,
+                    RDF.rest,
+                    cells[fork_index + 1] if fork_index + 1 < size else RDF.nil,
+                )
+            )
+        for i in removed:
+            if not shared[i]:
+                graph.remove((cells[i], None, None))
+        return deleted
