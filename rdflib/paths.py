@@ -171,10 +171,32 @@ No vars specified:
  (rdflib.term.URIRef('ex:h'), rdflib.term.URIRef('ex:a'))]
 
 ```
+
+Witnesses
+---------
+
+In addition to the endpoint pairs, eval_path_witness() returns one
+shortest witness for every reachable endpoint: the sequence of graph
+triples crossed, in traversal order, each marked as traversed forwards
+or backwards. The length of a witness is the number of RDF edges
+crossed, so zero-length matches have an empty witness.
+
+>>> for s, o, w in eval_path_witness(g, (e.a, e.p1/e.p2, e.e)):
+...     print(s, o, len(w))
+ex:a ex:e 2
+
+>>> list(eval_path_witness(g, (e.c, e.p3*ZeroOrMore, e.c)))
+[(rdflib.term.URIRef('ex:c'), rdflib.term.URIRef('ex:c'), ())]
+
+>>> for s, o, w in eval_path_witness(g, (e.e, ~(e.p1/e.p2), None)):
+...     print(s, o, [(step.predicate, step.forward) for step in w])
+ex:e ex:a [(rdflib.term.URIRef('ex:p2'), False), (rdflib.term.URIRef('ex:p1'), False)]
 """
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterator
@@ -182,6 +204,7 @@ from functools import total_ordering
 from typing import (
     TYPE_CHECKING,
     Any,
+    NamedTuple,
     Optional,
     Union,
 )
@@ -199,6 +222,22 @@ if TYPE_CHECKING:
 ZeroOrMore = "*"
 OneOrMore = "+"
 ZeroOrOne = "?"
+
+
+class WitnessStep(NamedTuple):
+    """
+    A single step of a path witness.
+
+    "subject", "predicate" and "object" are the triple exactly as stored in
+    the graph. "forward" is True when the step traversed the triple from
+    subject to object, and False when it was traversed in reverse (from
+    object to subject), as happens for inverse paths.
+    """
+
+    subject: Node
+    predicate: Node
+    object: Node
+    forward: bool
 
 
 def _n3(
@@ -229,6 +268,21 @@ class Path(ABC):
 
     @abstractmethod
     def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str: ...
+
+    def witness(
+        self,
+        graph: Graph,
+        subj: Optional[_SubjectType] = None,
+        obj: Optional[_ObjectType] = None,
+    ) -> Iterator[tuple[_SubjectType, _ObjectType, tuple[WitnessStep, ...]]]:
+        """
+        Evaluate this path against the graph and yield, for every reachable
+        endpoint, the endpoint pair together with one shortest witness.
+
+        This is a convenience wrapper around eval_path_witness();
+        see its documentation for details.
+        """
+        return eval_path_witness(graph, (subj, self, obj))
 
     def __hash__(self):
         return hash(repr(self))
@@ -509,6 +563,33 @@ class PathList(list):
     pass
 
 
+class _ReverseNegatedPath(Path):
+    """
+    The inverse relation of a NegatedPath.
+
+    Unlike a NegatedPath, which only ever follows triples forwards, this
+    follows triples backwards: from a node it reaches the subjects of
+    incoming triples whose predicate is not excluded. It is used
+    internally to compute witnesses when only the object is bound.
+    """
+
+    def __init__(self, arg: NegatedPath):
+        self.arg = arg
+
+    def eval(self, graph, subj=None, obj=None):
+        for s, p, o in graph.triples((None, None, subj)):
+            if (obj is None or s == obj) and _negated_path_allows(
+                graph, self.arg, s, p, o
+            ):
+                yield o, s
+
+    def __repr__(self) -> str:
+        return "Path(~! %s)" % ",".join(str(x) for x in self.arg.args)
+
+    def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
+        return "^%s" % self.arg.n3(namespace_manager)
+
+
 def path_alternative(self: Union[URIRef, Path], other: Union[URIRef, Path]):
     """
     alternative path
@@ -554,6 +635,220 @@ def eval_path(
     ],
 ) -> Iterator[tuple[_SubjectType, _ObjectType]]:
     return ((s, o) for s, p, o in graph.triples(t))
+
+
+_WitnessCacheType = dict[
+    tuple[Union[Path, URIRef], Node], dict[Node, list[WitnessStep]]
+]
+
+
+def eval_path_witness(
+    graph: Graph,
+    t: tuple[
+        Optional[_SubjectType],
+        Union[Path, URIRef],
+        Optional[_ObjectType],
+    ],
+) -> Iterator[tuple[_SubjectType, _ObjectType, tuple[WitnessStep, ...]]]:
+    """
+    Evaluate a property path against a graph and yield, for every reachable
+    endpoint pair, the pair together with one shortest witness of the match.
+
+    A witness is a tuple of WitnessStep, in traversal order, listing the
+    graph triples that were crossed and whether each was followed forwards
+    or backwards. Its length is the number of RDF edges crossed, so a
+    zero-length match (e.g. from a "*" or "?" modifier) has an empty witness.
+
+    Every reachable endpoint pair is yielded exactly once. When several
+    witnesses of the same minimal length exist, an arbitrary one is
+    returned. Every step of the witness conforms to the path expression:
+    the search is a breadth-first/Dijkstra exploration over expression
+    steps, not a plain shortest-path search filtered afterwards, and it
+    terminates even on cyclic graphs with expressions that match the empty
+    path.
+
+    The subject, or both the subject and the object, may be bound. If only
+    the object is bound, the search runs backwards from the object. If
+    neither is bound, all pairs are enumerated. Note that, as with
+    eval_path(), the graph passed in decides which triples are visible:
+    for a Dataset/ConjunctiveGraph, pass the graph view (context) the
+    witness should be computed in; no triples are drawn from other
+    contexts behind the caller's back.
+    """
+    subj, path, obj = t
+    cache: _WitnessCacheType = {}
+    if subj is not None:
+        for end, witness in _shortest_from(graph, path, subj, cache).items():
+            if obj is None or end == obj:
+                yield subj, end, tuple(witness)
+    elif obj is not None:
+        for start, witness in _shortest_from(
+            graph, _reverse_path(path), obj, cache
+        ).items():
+            yield start, obj, tuple(_flip_witness(witness))
+    else:
+        seen_starts = set()
+        for s, o in graph.subject_objects(None):
+            for node in (s, o):
+                if node in seen_starts:
+                    continue
+                seen_starts.add(node)
+                for end, witness in _shortest_from(graph, path, node, cache).items():
+                    yield node, end, tuple(witness)
+
+
+def _flip_witness(witness: list[WitnessStep]) -> list[WitnessStep]:
+    return [
+        WitnessStep(step.subject, step.predicate, step.object, not step.forward)
+        for step in reversed(witness)
+    ]
+
+
+def _reverse_path(path: Union[Path, URIRef]) -> Union[Path, URIRef]:
+    """
+    Return a path expression matching the inverse relation of "path",
+    so that witnesses can be searched backwards from a bound object.
+    """
+    if isinstance(path, URIRef):
+        return InvPath(path)
+    if isinstance(path, InvPath):
+        return path.arg
+    if isinstance(path, SequencePath):
+        return SequencePath(*[_reverse_path(a) for a in reversed(path.args)])
+    if isinstance(path, AlternativePath):
+        return AlternativePath(*[_reverse_path(a) for a in path.args])
+    if isinstance(path, MulPath):
+        return MulPath(_reverse_path(path.path), path.mod)
+    if isinstance(path, NegatedPath):
+        # a negated property set only follows triples forwards, so its
+        # inverse is not itself a negated property set
+        return _ReverseNegatedPath(path)
+    if isinstance(path, _ReverseNegatedPath):
+        return path.arg
+    raise Exception("Cannot reverse path: %s" % (path,))
+
+
+def _negated_path_allows(
+    graph: Graph, path: NegatedPath, s: Node, p: Node, o: Node
+) -> bool:
+    for a in path.args:
+        if isinstance(a, URIRef):
+            if p == a:
+                return False
+        elif isinstance(a, InvPath):
+            if (o, a.arg, s) in graph:
+                return False
+        else:
+            raise Exception("Invalid path in NegatedPath: %s" % (a,))
+    return True
+
+
+def _shortest_from(
+    graph: Graph,
+    path: Union[Path, URIRef],
+    start: Node,
+    cache: _WitnessCacheType,
+) -> dict[Node, list[WitnessStep]]:
+    """
+    Compute, for every node reachable from "start" via "path", one shortest
+    witness. Results are memoized in "cache" per (path, start) pair.
+    """
+    key = (path, start)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    result: dict[Node, list[WitnessStep]]
+    if isinstance(path, URIRef):
+        result = {}
+        for s, p, o in graph.triples((start, path, None)):
+            result[o] = [WitnessStep(s, p, o, True)]
+    elif isinstance(path, NegatedPath):
+        result = {}
+        for s, p, o in graph.triples((start, None, None)):
+            if o not in result and _negated_path_allows(graph, path, s, p, o):
+                result[o] = [WitnessStep(s, p, o, True)]
+    elif isinstance(path, _ReverseNegatedPath):
+        result = {}
+        for s, p, o in graph.triples((None, None, start)):
+            if s not in result and _negated_path_allows(graph, path.arg, s, p, o):
+                result[s] = [WitnessStep(s, p, o, False)]
+    elif isinstance(path, InvPath):
+        arg = path.arg
+        if isinstance(arg, URIRef):
+            result = {}
+            for s, p, o in graph.triples((None, arg, start)):
+                result[s] = [WitnessStep(s, p, o, False)]
+        else:
+            # walking ^arg from start crosses the same edges, in the same
+            # directions, as walking the reversed arg from start
+            result = _shortest_from(graph, _reverse_path(arg), start, cache)
+    elif isinstance(path, AlternativePath):
+        result = {}
+        for a in path.args:
+            for end, witness in _shortest_from(graph, a, start, cache).items():
+                if end not in result or len(witness) < len(result[end]):
+                    result[end] = witness
+    elif isinstance(path, SequencePath):
+        result = dict(_shortest_from(graph, path.args[0], start, cache))
+        for sub in path.args[1:]:
+            nxt: dict[Node, list[WitnessStep]] = {}
+            for mid, first_witness in result.items():
+                for end, second_witness in _shortest_from(
+                    graph, sub, mid, cache
+                ).items():
+                    witness = first_witness + second_witness
+                    if end not in nxt or len(witness) < len(nxt[end]):
+                        nxt[end] = witness
+            result = nxt
+    elif isinstance(path, MulPath):
+        result = _shortest_from_mul(graph, path, start, cache)
+    else:
+        raise Exception("Cannot compute witnesses for: %s" % (path,))
+    cache[key] = result
+    return result
+
+
+def _shortest_from_mul(
+    graph: Graph, path: MulPath, start: Node, cache: _WitnessCacheType
+) -> dict[Node, list[WitnessStep]]:
+    """
+    Dijkstra search over applications of the inner path of a ?, * or +
+    modified path. Edge weights are the lengths of the inner path's own
+    shortest witnesses, so the result is shortest in number of RDF edges
+    crossed, not in number of modifier applications.
+    """
+    dist: dict[Node, int] = {start: 0}
+    witnesses: dict[Node, list[WitnessStep]] = {start: []}
+    counter = itertools.count()
+    heap: list[tuple[int, int, Node]] = [(0, next(counter), start)]
+    done: set[Node] = set()
+    while heap:
+        d, _, node = heapq.heappop(heap)
+        if node in done:
+            continue
+        done.add(node)
+        if not path.more and node != start:
+            # ZeroOrOne: a single application of the inner path
+            continue
+        for end, witness in _shortest_from(graph, path.path, node, cache).items():
+            if end == start and path.zero:
+                # the empty match is always the shortest way back to start
+                continue
+            nd = d + len(witness)
+            cur = dist.get(end)
+            if cur is None or nd < cur or (end == start and cur == 0):
+                dist[end] = nd
+                witnesses[end] = witnesses[node] + witness
+                heapq.heappush(heap, (nd, next(counter), end))
+    result: dict[Node, list[WitnessStep]] = {}
+    for end, d in dist.items():
+        if d == 0:
+            # only start itself, via the empty match
+            if path.zero:
+                result[end] = []
+        else:
+            result[end] = witnesses[end]
+    return result
 
 
 def mul_path(p: Union[URIRef, Path], mul: _MulPathMod) -> MulPath:
