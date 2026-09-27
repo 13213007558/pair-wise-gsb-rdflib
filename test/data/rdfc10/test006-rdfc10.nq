@@ -1,0 +1,2 @@
+<http://example.org/s> <http://example.org/p> "01"^^<http://example.org/num> .
+<http://example.org/s> <http://example.org/p> "chat"@en .

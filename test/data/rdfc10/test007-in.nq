@@ -1,0 +1,4 @@
+_:a <http://example.org/p> _:b .
+_:b <http://example.org/p> _:a .
+_:a <http://example.org/q> "distinguisher" .
+

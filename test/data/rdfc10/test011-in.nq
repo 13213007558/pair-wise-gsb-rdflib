@@ -1,0 +1,4 @@
+<http://example.org/s> <http://example.org/p> "héllo wörld ⺟" .
+<http://example.org/s> <http://example.org/p> "line\nbreak\tand \"quote\"" .
+_:u <http://example.org/p> "héllo wörld ⺟" .
+

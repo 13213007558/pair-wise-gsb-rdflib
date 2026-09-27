@@ -1,0 +1,3 @@
+_:shared <http://example.org/p> "v" <http://example.org/g1> .
+_:shared <http://example.org/q> "v" <http://example.org/g2> .
+

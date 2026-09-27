@@ -1,0 +1,4 @@
+_:loop <http://example.org/p> _:loop .
+_:loop <http://example.org/q> _:other .
+_:other <http://example.org/q> _:loop .
+
