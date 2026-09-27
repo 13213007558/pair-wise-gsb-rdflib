@@ -67,6 +67,24 @@ except ImportError:
 
 _Triple = tuple[Identifier, Identifier, Identifier]
 
+#: Maximum number of input solutions that are sent to a remote endpoint in a
+#: single request when a SERVICE clause is evaluated in "bind-join" mode.
+#: When set to a positive integer, the solutions of the pattern to the left
+#: of a SERVICE clause are collected and sent to the remote endpoint in
+#: batches of at most this many solutions, using a VALUES clause appended to
+#: the service query, instead of issuing one request per solution.  The
+#: results are then joined back with the input solutions locally.  None
+#: (the default) disables bind-join batching and evaluates SERVICE clauses
+#: with one request per input solution.
+SERVICE_BIND_JOIN_BATCH_SIZE: Optional[int] = None
+
+
+def _serviceBindJoinBatchSize() -> Optional[int]:
+    batch_size = SERVICE_BIND_JOIN_BATCH_SIZE
+    if isinstance(batch_size, int) and batch_size > 0:
+        return batch_size
+    return None
+
 
 def evalBGP(
     ctx: QueryContext, bgp: list[_Triple]
@@ -150,6 +168,13 @@ def evalLazyJoin(
 def evalJoin(ctx: QueryContext, join: CompValue) -> Generator[FrozenDict, None, None]:
     # TODO: Deal with dict returned from evalPart from GROUP BY
     # only ever for join.p1
+
+    if join.p2.name == "ServiceGraphPattern":
+        batch_size = _serviceBindJoinBatchSize()
+        if batch_size is not None:
+            plan = _prepareServiceBindJoin(ctx, join.p2)
+            if plan is not None:
+                return evalServiceBindJoin(ctx, join, plan, batch_size)
 
     if join.lazy:
         return evalLazyJoin(ctx, join)
@@ -335,7 +360,6 @@ def evalPart(ctx: QueryContext, part: CompValue) -> Any:
 
 
 def evalServiceQuery(ctx: QueryContext, part: CompValue):
-    res = {}
     match = re.match(
         "^service <(.*)>[ \n]*{(.*)}[ \n]*$",
         # type error: Argument 2 to "get" of "CompValue" has incompatible type "str"; expected "bool"  [arg-type]
@@ -346,42 +370,49 @@ def evalServiceQuery(ctx: QueryContext, part: CompValue):
     if match:
         service_url = match.group(1)
         service_query = _buildQueryStringForServiceCall(ctx, match.group(2))
+        json_dict = _serviceRequest(service_url, service_query)
+        variables = json_dict["head"]["vars"]
+        # or just return the bindings?
+        res = json_dict["results"]["bindings"]
+        if len(res) > 0:
+            for r in res:
+                # type error: Argument 2 to "_yieldBindingsFromServiceCallResult" has incompatible type "str"; expected "dict[str, dict[str, str]]"
+                for bound in _yieldBindingsFromServiceCallResult(ctx, r, variables):
+                    yield bound
 
-        query_settings = {"query": service_query, "output": "json"}
-        headers = {
-            "accept": "application/sparql-results+json",
-            "user-agent": "rdflibForAnUser",
-        }
-        # GET is easier to cache so prefer that if the query is not to long
-        if len(service_query) < 600:
-            response = urlopen(
-                Request(service_url + "?" + urlencode(query_settings), headers=headers)
+
+def _serviceRequest(service_url: str, service_query: str) -> Any:
+    """
+    Send a SPARQL query to a remote endpoint and return the parsed JSON
+    result.  Raises an Exception if the endpoint does not respond with a
+    200 status code.
+    """
+    query_settings = {"query": service_query, "output": "json"}
+    headers = {
+        "accept": "application/sparql-results+json",
+        "user-agent": "rdflibForAnUser",
+    }
+    # GET is easier to cache so prefer that if the query is not to long
+    if len(service_query) < 600:
+        response = urlopen(
+            Request(service_url + "?" + urlencode(query_settings), headers=headers)
+        )
+    else:
+        response = urlopen(
+            Request(
+                service_url,
+                data=urlencode(query_settings).encode(),
+                headers=headers,
             )
+        )
+    if response.status == 200:
+        if _HAS_ORJSON:
+            return orjson.loads(response.read())
         else:
-            response = urlopen(
-                Request(
-                    service_url,
-                    data=urlencode(query_settings).encode(),
-                    headers=headers,
-                )
-            )
-        if response.status == 200:
-            if _HAS_ORJSON:
-                json_dict = orjson.loads(response.read())
-            else:
-                json_dict = json.loads(response.read())
-            variables = res["vars_"] = json_dict["head"]["vars"]
-            # or just return the bindings?
-            res = json_dict["results"]["bindings"]
-            if len(res) > 0:
-                for r in res:
-                    # type error: Argument 2 to "_yieldBindingsFromServiceCallResult" has incompatible type "str"; expected "dict[str, dict[str, str]]"
-                    for bound in _yieldBindingsFromServiceCallResult(ctx, r, variables):
-                        yield bound
-        else:
-            raise Exception(
-                "Service: %s responded with code: %s", service_url, response.status
-            )
+            return json.loads(response.read())
+    raise Exception(
+        "Service: %s responded with code: %s", service_url, response.status
+    )
 
 
 """
@@ -419,6 +450,14 @@ def _buildQueryStringForServiceCall(ctx: QueryContext, service_query: str) -> st
 def _yieldBindingsFromServiceCallResult(
     ctx: QueryContext, r: dict[str, dict[str, str]], variables: list[str]
 ) -> Generator[FrozenBindings, None, None]:
+    yield FrozenBindings(ctx, _bindingsFromServiceCallResult(r, variables))
+
+
+def _bindingsFromServiceCallResult(
+    r: dict[str, dict[str, str]],
+    variables: list[str],
+    bnode_map: Optional[dict[str, BNode]] = None,
+) -> dict[Variable, Identifier]:
     res_dict: dict[Variable, Identifier] = {}
     for var in variables:
         if var in r and r[var]:
@@ -439,10 +478,355 @@ def _yieldBindingsFromServiceCallResult(
                     var_binding["value"], datatype=URIRef(var_binding["datatype"])
                 )
             elif var_type == "bnode":
-                res_dict[Variable(var)] = BNode(var_binding["value"])
+                if bnode_map is None:
+                    res_dict[Variable(var)] = BNode(var_binding["value"])
+                else:
+                    # Blank node labels are only scoped to a single response.
+                    # Remap them so that identical labels returned by
+                    # different requests are not conflated into one node,
+                    # while identical labels within one response still
+                    # denote the same node.
+                    label = var_binding["value"]
+                    if label not in bnode_map:
+                        bnode_map[label] = BNode()
+                    res_dict[Variable(var)] = bnode_map[label]
             else:
                 raise ValueError(f"invalid type {var_type!r} for variable {var!r}")
-    yield FrozenBindings(ctx, res_dict)
+    return res_dict
+
+
+_SERVICE_STRING_RE = re.compile(
+    r"^\s*service\s+(?:silent\s+)?(?:<[^>]*>|[?$][^\s{]+)\s*\{(.*)\}\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+#: Solution modifiers and aggregates make a SELECT query unsafe to batch:
+#: they are applied per request when evaluating row by row, but would apply
+#: to the whole batch when the input solutions are combined into a single
+#: request.  Queries containing them are evaluated one solution at a time.
+#: (DISTINCT/REDUCED are safe: the internal row variable keeps the solutions
+#: of different input rows distinct.)
+_SERVICE_UNBATCHABLE_RE = re.compile(
+    r"\b(?:limit|offset|group\s+by|having|count|sum|avg|min|max|sample"
+    r"|group_concat)\b",
+    re.IGNORECASE,
+)
+
+#: Name of the internal variable used to correlate remote results with the
+#: input solutions of a bind-join batch.  If a user query already uses this
+#: name, underscores are prepended until it no longer collides.
+_SERVICE_BIND_JOIN_ROW_VARIABLE = "__rdflib_service_bind_join_row"
+
+
+class _ServiceBindJoinPlan:
+    """
+    Precomputed information needed to rewrite a SERVICE pattern into a
+    bind-join batch query.
+    """
+
+    def __init__(
+        self,
+        term: Union[URIRef, Variable],
+        silent: bool,
+        inner_query: str,
+        prologue_prefix: str,
+        projection_insert_at: Optional[int],
+        values_insert_at: Optional[int],
+    ):
+        self.term = term
+        self.silent = silent
+        self.inner_query = inner_query
+        self.prologue_prefix = prologue_prefix
+        self.projection_insert_at = projection_insert_at
+        self.values_insert_at = values_insert_at
+
+    def build_query(self, values_clause: str, row_variable: str) -> str:
+        if self.values_insert_at is None:
+            # A bare group graph pattern: wrap it in a SELECT and put the
+            # VALUES clause inside the group so that the join variables are
+            # projected by SELECT *.
+            return (
+                self.prologue_prefix
+                + "SELECT REDUCED * WHERE { "
+                + self.inner_query
+                + " "
+                + values_clause
+                + " }"
+            )
+        query = self.inner_query
+        close_at = self.values_insert_at
+        if self.projection_insert_at is not None:
+            # The inner query has an explicit projection; add the internal
+            # row variable to it so that it is returned by the endpoint.
+            inject = " ?" + row_variable + " "
+            query = (
+                query[: self.projection_insert_at]
+                + inject
+                + query[self.projection_insert_at :]
+            )
+            close_at += len(inject)
+        # Put the VALUES clause inside the outermost group graph pattern;
+        # this is semantically equivalent to a trailing VALUES clause (the
+        # join happens before any solution modifiers are applied).
+        return query[:close_at] + " " + values_clause + " " + query[close_at:]
+
+
+def _findServiceQueryBraces(query: str) -> Optional[tuple[int, int]]:
+    """
+    Find the first top-level "{ ... }" group in a query string, skipping
+    comments, string literals and IRI references.  Returns the positions of
+    the opening and closing brace, or None if there is no balanced group.
+    """
+    start: Optional[int] = None
+    depth = 0
+    i = 0
+    n = len(query)
+    while i < n:
+        ch = query[i]
+        if ch == "#":
+            j = query.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif ch == '"' or ch == "'":
+            if query.startswith(ch * 3, i):
+                j = query.find(ch * 3, i + 3)
+                i = n if j < 0 else j + 3
+            else:
+                j = i + 1
+                while j < n:
+                    if query[j] == "\\":
+                        j += 1
+                    elif query[j] == ch:
+                        break
+                    j += 1
+                i = j + 1
+        elif ch == "<":
+            # IRI references cannot contain spaces or braces; anything else
+            # is a comparison operator.
+            j = i + 1
+            while j < n and query[j] not in "> \t\r\n{}\"'":
+                j += 1
+            if j < n and query[j] == ">":
+                i = j + 1
+            else:
+                i += 1
+        elif ch == "{":
+            if start is None:
+                start = i
+            depth += 1
+            i += 1
+        elif ch == "}":
+            depth -= 1
+            i += 1
+            if depth == 0 and start is not None:
+                return start, i - 1
+        else:
+            i += 1
+    return None
+
+
+def _prepareServiceBindJoin(
+    ctx: QueryContext, part: CompValue
+) -> Optional[_ServiceBindJoinPlan]:
+    """
+    Analyze a ServiceGraphPattern and return a plan for bind-join batch
+    evaluation, or None if the pattern cannot be batched (in which case it
+    should be evaluated one input solution at a time).
+    """
+    # NB: CompValue.get returns the key itself when it is absent, so
+    # presence checks must use "in".
+    service_string = part["service_string"] if "service_string" in part else ""
+    match = _SERVICE_STRING_RE.match(service_string) if service_string else None
+    if match is None:
+        return None
+    term = part.get("term")
+    if not isinstance(term, (URIRef, Variable)):
+        return None
+    inner_query = match.group(1)
+    silent = "silent" in part
+    try:
+        parser.parseQuery(inner_query)
+    except ParseException:
+        # The service pattern is a bare group graph pattern; it is wrapped
+        # in a SELECT and the VALUES clause is placed inside the group.
+        prefix = ""
+        # type error: Item "None" of "Optional[Prologue]" has no attribute "namespace_manager"
+        for p in ctx.prologue.namespace_manager.store.namespaces():  # type: ignore[union-attr]
+            prefix = prefix + "PREFIX " + p[0] + ":" + p[1].n3() + " "
+        # re add the base if one was defined
+        # type error: Item "None" of "Optional[Prologue]" has no attribute "base"
+        base = ctx.prologue.base  # type: ignore[union-attr]
+        if base is not None and len(base) > 0:
+            prefix = "BASE <" + base + "> " + prefix
+        plan: Optional[_ServiceBindJoinPlan] = _ServiceBindJoinPlan(
+            term, silent, inner_query, prefix, None, None
+        )
+    else:
+        if re.match(r"\s*select\b", inner_query, re.IGNORECASE) is None:
+            # Only SELECT queries can be rewritten for bind-join.
+            return None
+        if _SERVICE_UNBATCHABLE_RE.search(inner_query) is not None:
+            # Solution modifiers and aggregates would change meaning when
+            # several input solutions are combined into one request.
+            return None
+        braces = _findServiceQueryBraces(inner_query)
+        if braces is None:
+            return None
+        open_at, close_at = braces
+        projection_match = re.match(
+            r"\s*select\s+(?:(?:distinct|reduced)\s+)?",
+            inner_query,
+            re.IGNORECASE,
+        )
+        assert projection_match is not None
+        projection_start = projection_match.end()
+        where_match = re.search(
+            r"\bwhere\b", inner_query[projection_start:open_at], re.IGNORECASE
+        )
+        projection_insert_at: Optional[int] = (
+            projection_start + where_match.start() if where_match else open_at
+        )
+        if inner_query[projection_start:projection_insert_at].strip() == "*":
+            # SELECT * projects the join variables already.
+            projection_insert_at = None
+        plan = _ServiceBindJoinPlan(
+            term, silent, inner_query, "", projection_insert_at, close_at
+        )
+    # Verify that the rewritten query is still syntactically valid; if not,
+    # fall back to evaluating one input solution at a time.
+    try:
+        parser.parseQuery(
+            plan.build_query(
+                "VALUES (?" + _SERVICE_BIND_JOIN_ROW_VARIABLE + ") { ( 0 ) }",
+                _SERVICE_BIND_JOIN_ROW_VARIABLE,
+            )
+        )
+    except ParseException:
+        return None
+    return plan
+
+
+def evalServiceBindJoin(
+    ctx: QueryContext,
+    join: CompValue,
+    plan: _ServiceBindJoinPlan,
+    batch_size: int,
+) -> Generator[FrozenBindings, None, None]:
+    """
+    Evaluate a join whose right-hand side is a SERVICE clause in bind-join
+    mode: the input solutions are sent to the remote endpoint in batches of
+    at most batch_size solutions using a VALUES clause, and the results are
+    joined back with the input solutions locally.  This only changes the
+    number of requests, not the SPARQL bag semantics of the join.
+    """
+    rows = list(evalPart(ctx, join.p1))
+    endpoint_groups: list[tuple[str, list[FrozenBindings]]]
+    if isinstance(plan.term, URIRef):
+        endpoint_groups = [(str(plan.term), rows)]
+        no_endpoint: list[FrozenBindings] = []
+    else:
+        # The endpoint is dynamic: batch input solutions per endpoint IRI.
+        groups: dict[str, list[FrozenBindings]] = {}
+        no_endpoint = []
+        for row in rows:
+            endpoint = row.get(plan.term)
+            if isinstance(endpoint, URIRef):
+                groups.setdefault(str(endpoint), []).append(row)
+            else:
+                no_endpoint.append(row)
+        endpoint_groups = list(groups.items())
+    for endpoint, group_rows in endpoint_groups:
+        for start in range(0, len(group_rows), batch_size):
+            yield from _evalServiceBindJoinBatch(
+                ctx, plan, endpoint, group_rows[start : start + batch_size]
+            )
+    for row in no_endpoint:
+        # No endpoint IRI is available for this solution; this is a service
+        # failure for this solution.
+        if plan.silent:
+            yield row
+        else:
+            raise SPARQLError(
+                "Service: endpoint variable %s is not bound to an IRI" % plan.term
+            )
+
+
+def _evalServiceBindJoinBatch(
+    ctx: QueryContext,
+    plan: _ServiceBindJoinPlan,
+    endpoint: str,
+    rows: list[FrozenBindings],
+) -> Generator[FrozenBindings, None, None]:
+    thawed = [ctx.thaw(row) for row in rows]
+    row_bindings = [
+        {k: v for k, v in c.solution().items() if isinstance(k, Variable)}
+        for c in thawed
+    ]
+    mentioned = set(re.findall(r"[?$](\w+)", plan.inner_query))
+    # Only send bindings for variables that also occur in the service
+    # query; other bindings cannot affect the remote evaluation.
+    send_vars: list[Variable] = []
+    for bindings in row_bindings:
+        for var in bindings:
+            if var not in send_vars and str(var) in mentioned:
+                send_vars.append(var)
+    used_names = set(mentioned)
+    for bindings in row_bindings:
+        used_names.update(str(v) for v in bindings)
+    row_variable = _SERVICE_BIND_JOIN_ROW_VARIABLE
+    while row_variable in used_names:
+        row_variable = "_" + row_variable
+    values_rows = []
+    for index, bindings in enumerate(row_bindings):
+        values = [str(index)]
+        for var in send_vars:
+            value = bindings.get(var)
+            if value is None or isinstance(value, BNode):
+                # Unbound variables stay unbound (UNDEF); blank nodes cannot
+                # be referenced in a VALUES clause and are filtered out by
+                # the compatibility check below instead.
+                values.append("UNDEF")
+            else:
+                values.append(value.n3())
+        values_rows.append("( " + " ".join(values) + " )")
+    values_clause = (
+        "VALUES (?"
+        + " ?".join([row_variable] + [str(v) for v in send_vars])
+        + ") { "
+        + " ".join(values_rows)
+        + " }"
+    )
+    query = plan.build_query(values_clause, row_variable)
+    row_variable_term = Variable(row_variable)
+    try:
+        json_dict = _serviceRequest(endpoint, query)
+        variables = json_dict["head"]["vars"]
+        parsed: list[tuple[int, dict[Variable, Identifier]]] = []
+        bnode_map: dict[str, BNode] = {}
+        for r in json_dict["results"]["bindings"]:
+            res_dict = _bindingsFromServiceCallResult(r, variables, bnode_map)
+            row_id = res_dict.pop(row_variable_term, None)
+            if row_id is None:
+                raise SPARQLError(
+                    "Service: %s did not return the bind-join row variable"
+                    % endpoint
+                )
+            index = int(row_id)
+            if 0 <= index < len(rows):
+                parsed.append((index, res_dict))
+    except Exception:
+        if plan.silent:
+            # A failed batch with SILENT evaluates to the input solutions.
+            for row in rows:
+                yield row
+            return
+        raise
+    for index, res_dict in parsed:
+        local = row_bindings[index]
+        # Only join compatible solutions; this mirrors the compatible join
+        # semantics for variables that could not be restricted remotely
+        # (e.g. blank nodes sent as UNDEF).
+        if all(var not in local or local[var] == val for var, val in res_dict.items()):
+            yield FrozenBindings(thawed[index], res_dict).merge(rows[index])
 
 
 def evalGroup(ctx: QueryContext, group: CompValue):
